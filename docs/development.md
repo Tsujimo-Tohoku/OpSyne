@@ -90,6 +90,29 @@ GitHubのリモート、branch protection、公開、merge、deployは今回設�
 
 `.local/opsyne/` には原本、4つのSQLite DB、署名鍵、ログイン用トークンが入ります。製品プロセスを停止して専用CLIで一式をバックアップします。DBだけのコピーや、復元先での過去操作の再実行は避けてください。
 
+## 承認説明のブラウザ検証（任意）
+
+`scripts/test_adapter_review_ui.cjs` は実ブラウザから作成・説明編集・競合・再確認・承認を試験します。
+Node.js、Playwright、Microsoft Edgeが必要です。Playwrightが通常の探索パスにない場合は
+`NODE_PATH` にインストール先の `node_modules` を指定します。通常のPython検査とは分離しています。
+
+専用の空のデータディレクトリでテストサーバーを起動します。実運用のデータは指定しないでください。
+
+```text
+python scripts/dev.py run --locked python -c "from pathlib import Path; from opsyne.runtime import Runtime; from opsyne.api.app import create_app; import uvicorn; uvicorn.run(create_app(runtime=Runtime(Path('.local/issue4-ui-check')), background=False), host='127.0.0.1', port=8766)"
+```
+
+別の端末で実行します。
+
+```text
+node --check src/opsyne/web/app.js
+node scripts/test_adapter_review_ui.cjs http://127.0.0.1:8766 .local/issue4-ui-check
+```
+
+テストは合成ログ・定義を作成します。保存・承認は実APIを使用し、Agent説明と旧形式の表示確認のみ
+応答を合成データへ置換します。LLMは呼び出しません。デスクトップ・390px幅のスクリーンショットは
+指定データディレクトリの `screenshots/` に保存します。終了後はテストサーバーを停止してください。
+
 ## 問題切り分け
 
 - `uv is missing` / 版不一致: `python scripts/bootstrap.py` を再実行。

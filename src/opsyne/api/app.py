@@ -16,9 +16,10 @@ from pydantic import Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from opsyne.api.auth import AccessTokens
+from opsyne.contracts.adapter_reviews import AdapterDraftRequest, ExplanationUpdate
 from opsyne.contracts.core import Actor, Model, Service
 from opsyne.contracts.execution import Capability, CheckConfig
-from opsyne.contracts.observations import AdapterDefinition, RawInput, Source
+from opsyne.contracts.observations import RawInput, Source
 from opsyne.control.repository import Conflict
 from opsyne.runtime import Runtime
 
@@ -286,8 +287,23 @@ def create_app(
         return state.verify(execution_id, actor).model_dump(mode="json")
 
     @app.post("/api/adapters")
-    def adapter(body: AdapterDefinition, actor: Actor = editing) -> dict[str, Any]:
-        return state.adapters.propose(body, actor.actor)
+    def adapter(body: AdapterDraftRequest, actor: Actor = editing) -> dict[str, Any]:
+        return state.adapters.propose(
+            state.adapters.definition(body.model_dump(mode="json")), actor.actor, body.explanation
+        )
+
+    @app.get("/api/adapters/{adapter_id}")
+    def adapter_detail(adapter_id: str, actor: Actor = authentication) -> dict[str, Any]:
+        return state.control.get("adapter", adapter_id)
+
+    @app.put("/api/adapters/{adapter_id}/explanation")
+    def adapter_explanation(
+        adapter_id: str, body: ExplanationUpdate, actor: Actor = editing
+    ) -> dict[str, Any]:
+        with state._lock:
+            return state.adapters.update_explanation(
+                adapter_id, body.digest, body.explanation, actor
+            )
 
     @app.post("/api/adapters/{adapter_id}/approve")
     def approve_adapter(

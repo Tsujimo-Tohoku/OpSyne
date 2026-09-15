@@ -22,6 +22,7 @@ from opsyne.api.app import create_app
 from opsyne.cli import backup, load_env, main, restore
 from opsyne.connectors.http import HttpConnector
 from opsyne.contracts.adapter_proposals import AdapterProposal, FieldMapping
+from opsyne.contracts.adapter_reviews import HumanExplanation
 from opsyne.contracts.cases import Analysis, Case, EvidenceClaim, Task
 from opsyne.contracts.core import Actor, Service
 from opsyne.contracts.execution import Capability, CheckConfig
@@ -295,6 +296,7 @@ def test_adapter_agent_task_creates_only_a_scoped_unapproved_draft(
         calls.append(task.id)
         return AdapterProposal(
             name="Limited message interpretation",
+            suggested_use="メッセージ内容の調査",
             fields=[FieldMapping(field="message", path="message")],
             conditions=[],
             outcome_map=[],
@@ -316,6 +318,19 @@ def test_adapter_agent_task_creates_only_a_scoped_unapproved_draft(
     assert drafts[0]["source_id"] == "demo-log"
     assert drafts[0]["target_instance_id"] == "demo-checkout-v1"
     assert drafts[0]["target_version"] == 1
+    explanation = drafts[0]["explanation"]
+    assert explanation["human"] is None and explanation["recorded_by"] is None
+    assert explanation["agent"]["task_id"] == task.id
+    assert explanation["agent"]["suggested_use"] == "メッセージ内容の調査"
+    assert explanation["agent"]["rationale"][0]["evidence_ids"] == case["evidence_ids"]
+    assert explanation["agent"]["unknowns"] == [
+        "Outcome and severity semantics are not established"
+    ]
+    runtime.adapters.update_explanation(
+        drafts[0]["id"], drafts[0]["digest"], HumanExplanation(monitoring_purpose="ログ調査"), OWNER
+    )
+    saved = runtime.control.get("adapter", drafts[0]["id"])
+    assert saved["explanation"]["agent"] == explanation["agent"]
     assert runtime.adapters.active() == []
     assert runtime.runner.list() == []
     assert runtime.demo.check("demo-checkout").status == "FAIL"

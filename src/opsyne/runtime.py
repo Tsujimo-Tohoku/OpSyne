@@ -16,6 +16,7 @@ from opsyne.agents.investigator import Investigator
 from opsyne.collector.service import Collector
 from opsyne.connectors.demo import DemoConnector
 from opsyne.connectors.http import HttpConnector
+from opsyne.contracts.adapter_reviews import AgentExplanation
 from opsyne.contracts.cases import Analysis, Case, EvidenceGrant, Task
 from opsyne.contracts.core import Actor, Service
 from opsyne.contracts.execution import Capability, CheckConfig, Execution, VerificationResult
@@ -450,7 +451,16 @@ class Runtime:
                                 definition.id,
                                 str(len(samples)),
                             )
-                        self.adapters.propose(definition, "agent:adapter")
+                        self.adapters.propose(
+                            definition,
+                            "agent:adapter",
+                            agent_explanation=AgentExplanation(
+                                task_id=task.id,
+                                suggested_use=proposal.suggested_use,
+                                rationale=proposal.rationale,
+                                unknowns=proposal.unknowns,
+                            ),
+                        )
                     recommendations.append(f"変換定義 {definition.id} の内容・意味を確認して承認")
                 analysis = Analysis(
                     summary="変換定義を提案しました" if proposal.fields else "変換定義の提案を保留",
