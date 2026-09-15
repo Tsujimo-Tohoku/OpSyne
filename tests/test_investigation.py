@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-import httpx
+import httpx2 as httpx
 import pytest
 from openai import OpenAI
 from pydantic import JsonValue
