@@ -1,10 +1,14 @@
-# Control bridge v1 接続提案
+# Control bridge v1 接続仕様
 
-**この文書はBot側の接続案であり、本体に実装済みのAPI仕様ではありません。** Bot側コードは [bridge.py](../src/opsyne_discord/bridge.py)、[app.py](../src/opsyne_discord/app.py)、[presentation.py](../src/opsyne_discord/presentation.py) を参照してください。
+本体の専用APIとBotの接続仕様です。[設定・起動手順](../../../docs/discord-setup.md)と
+[ADR 0007](../../../docs/adr/0007-discord-bridge.md)を参照してください。
+本体実装は `src/opsyne/api/discord.py` と `src/opsyne/control/discord.py`、
+Bot側は [bridge.py](../src/opsyne_discord/bridge.py)、[app.py](../src/opsyne_discord/app.py)、[presentation.py](../src/opsyne_discord/presentation.py) です。
 
 ## 1. 接続先と認証
 
-`DISCORD_CONTROL_BRIDGE_URL` に設定した単一のURLへPOSTする。既定のルート名は定めず、Interaction本文のURL・引数から送信先を選ばない。URLと `DISCORD_CONTROL_BRIDGE_TOKEN` は両方設定するか、両方空にする。未設定なら承認・実行を行わない旨を返す。
+`DISCORD_CONTROL_BRIDGE_URL` に設定した単一のURLへPOSTする。本体のルートは `/api/discord/interactions`。
+Interaction本文のURL・引数から送信先を選ばない。URLと `DISCORD_CONTROL_BRIDGE_TOKEN` は両方設定するか、両方空にする。未設定なら承認・実行を行わない旨を返す。
 
 送信はHTTPSに限定する。HTTPはループバック試験だけを許可し、リダイレクトを追跡しない。ヘッダーは `Authorization: Bearer <DISCORD_CONTROL_BRIDGE_TOKEN>`。この資格情報は限定したbridgeへのアクセス用であり、管理者権限や人の承認を表さない。
 
@@ -43,7 +47,9 @@ Botが認識する操作は `/opsyne case id:<参照ID>`、`/opsyne plan id:<参
 
 ## 4. 応答JSON
 
-全応答はHTTP 2xxのJSONとし、`protocol` は `opsyne-discord/v1`。トップレベルの許可フィールドは `protocol`、`kind`、`case`、`plan`、`confirmation_id` のみ。後ろ3つは未使用なら省略またはnullとする。
+成功応答はHTTP 2xxのJSONとし、`protocol` は `opsyne-discord/v1`。トップレベルの許可フィールドは `protocol`、`kind`、`case`、`plan`、`confirmation_id` のみ。後ろ3つは未使用なら省略またはnullとする。
+不正な署名・権限不足は403、存在しない対象は404、状態競合は409、設定を読めない場合は503。
+Botは非2xxを受付結果不明として表示し、承認POSTを再送しない。
 
 | `kind` | 必要な内容 | Botの表示・処理 |
 |---|---|---|
@@ -74,7 +80,12 @@ Botが認識する操作は `/opsyne case id:<参照ID>`、`/opsyne plan id:<参
 
 Botは計画を全文表示できない場合、必須情報が欠ける場合、日時等が不正な場合に操作ボタンを付けない。期限の現在照合はbridgeが行う。
 
-**本体との変換は未確定。** 現在確認した本体の `Plan` は計画独自の `version` を持たず、IDとdigestで固定内容を扱う。Botの `PlanView.version` に `target_version` を流用したり、値を推測したりしない。`preconditions` 等も含め、統合時に根拠ある変換または表示契約の改訂を合意・試験する。
+本体の `Plan` は計画独自の `version` を持たず、IDとdigestで固定内容を扱う。
+`version=1` は表示形式の版であり、画面も「表示形式の版」と表示する。
+`preconditions` は本体の実行時検査（独立チェックFAIL、対象・能力・承認世代の一致、競合なし）を表す。
+`operation` には操作能力ID・版、提案者、理由、根拠参照を含める。
+省略可能な `state`（既定DRAFT）と `approver`（既定空文字）も返し、DRAFT以外に操作ボタンを付けない。
+計画詳細を開示できるサービスと利用者・channelを本体設定で制限する。
 
 ### 不明・不正・遅延時
 
@@ -103,4 +114,11 @@ Bot側の実装済み受付は `POST /notifications`。`Authorization: Bearer <D
 
 配送は `worker` が継続処理し、`deliver-once` は最大1件を担当する。同じ状態ディレクトリへの送信はOSファイルロックで排他化する。明確な429は応答受領から指定待機時間後に再試行し、通信障害・不確かな成功応答・5xx等は `UNKNOWN` として自動再送しない。Workerは起動時に排他ロック取得後、残った `SENDING` を `UNKNOWN` にする。独立照合は配送用CLIを使う。
 
-現在、本体の案件更新とこの通知受付にトランザクション上の結合はない。本体側で案件変更と通知送信待ちを同じトランザクションへ保存し、再送時にも一意IDと内容を維持する接続が必要。BotのSQLiteだけでは、本体から届く前の通知喪失を防げない。案件スレッド作成、既存メッセージ更新、本体からの自動配送開始もこの接続案の実装済み範囲には含めない。
+本体統合では `POST /notifications` への直接送信に代わり、次のpull方式を使用する。
+
+- 本体は案件更新と `discord_events` を同一Controlトランザクションで保存する。
+- Botの `sync` が `DISCORD_CONTROL_FEED_URL` の `/api/discord/notifications?cursor=...` を専用Bearerで取得する。
+- 応答は `protocol`、`events`（上記case通知形式の配列、最大100件）、`cursor`。
+- 全イベントをBotのoutboxへ保存してからカーソルを保存し、停止後の再取込をevent_idで重複排除する。
+- 設定・権限世代変更・復元で古いカーソルを拒否する。照合後の明示的リセットが必要。
+- Plan通知の自動配信、案件スレッド作成、既存メッセージ編集は未対応。案件通知の計画IDから `/opsyne plan` を使う。

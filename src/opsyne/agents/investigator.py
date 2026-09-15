@@ -21,6 +21,9 @@ supplied IDs. Never invent observations or infer normality, success, or absence 
 missing or truncated evidence. State missing context and truncation in unknowns. Recommendations
 are proposals only; you cannot authorize, execute, or verify production changes.
 No tools are available.
+When registered_recovery is supplied, you may propose one listed capability using its exact
+ID and version in recovery, with a reason and supplied evidence IDs. Set recovery to null when
+no listed operation is appropriate or the evidence is insufficient. Never invent an operation.
 Respond in Japanese, keeping identifiers unchanged. Do not reproduce credentials or secret values.
 """
 
@@ -50,7 +53,12 @@ class Investigator:
                 timeout=30,
             )
 
-    def investigate(self, task: Task, evidence: list[dict[str, JsonValue]]) -> Analysis:
+    def investigate(
+        self,
+        task: Task,
+        evidence: list[dict[str, JsonValue]],
+        recovery_context: dict[str, JsonValue] | None = None,
+    ) -> Analysis:
         if self._client is None:
             raise InvestigationError("OpenAI API key is not configured")
         if time.time() >= task.expires_at or task.status != "RUNNING":
@@ -89,6 +97,7 @@ class Investigator:
                     "role": task.role,
                 },
                 "untrusted_evidence": evidence,
+                "registered_recovery": recovery_context,
             },
             ensure_ascii=False,
         )

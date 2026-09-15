@@ -18,6 +18,7 @@ from pydantic import Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from opsyne.api.auth import AccessTokens
+from opsyne.api.discord import register_discord
 from opsyne.api.heroku import install_heroku_drain, load_drains
 from opsyne.collector.log_discovery import discover_logs
 from opsyne.contracts.adapter_reviews import AdapterDraftRequest, ExplanationUpdate
@@ -94,6 +95,9 @@ def create_app(
     app.state.runtime = state
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
     install_heroku_drain(app, state, drains)
+    discord_config = os.environ.get("OPSYNE_DISCORD_CONFIG")
+    if discord_config:
+        register_discord(app, state.control, tokens, Path(discord_config))
 
     @app.middleware("http")
     async def local_request_boundary(request: Request, call_next: Any) -> Response:
@@ -324,6 +328,24 @@ def create_app(
     @app.post("/api/plans/{plan_id}/reject")
     def reject(plan_id: str, body: Reason, actor: Actor = authentication) -> dict[str, Any]:
         return state.control.reject(plan_id, actor, body.reason)
+
+    @app.post("/api/plans/{plan_id}/approve-and-execute")
+    def approve_and_execute(
+        plan_id: str, body: Approval, actor: Actor = authentication
+    ) -> dict[str, Any]:
+        state.control.approve(plan_id, body.digest, actor, run_recovery=True)
+        return state.control.get("recovery", plan_id)
+
+    @app.get("/api/plans/{plan_id}/recovery")
+    def recovery_status(plan_id: str, actor: Actor = authentication) -> dict[str, Any]:
+        return state.control.get("recovery", plan_id)
+
+    @app.get("/api/services/{service_id}/recoveries")
+    def service_recoveries(service_id: str, actor: Actor = authentication) -> list[dict[str, Any]]:
+        state.control.service(service_id)
+        return [
+            item for item in state.control.objects("recovery") if item["service_id"] == service_id
+        ]
 
     @app.post("/api/plans/{plan_id}/execute")
     def execute(plan_id: str, actor: Actor = editing) -> dict[str, Any]:

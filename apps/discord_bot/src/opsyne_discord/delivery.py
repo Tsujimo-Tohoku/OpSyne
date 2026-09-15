@@ -72,6 +72,22 @@ class Outbox:
                 )"""
             )
             db.execute("INSERT OR IGNORE INTO delivery_state VALUES (1, 0)")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS feed_cursor (id TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+
+    def cursor(self, source: str) -> str:
+        with self._connection() as db:
+            row = db.execute("SELECT value FROM feed_cursor WHERE id=?", (source,)).fetchone()
+            return str(row[0]) if row else ""
+
+    def save_cursor(self, source: str, cursor: str) -> None:
+        with self._connection() as db:
+            db.execute(
+                "INSERT INTO feed_cursor VALUES (?,?) "
+                "ON CONFLICT(id) DO UPDATE SET value=excluded.value",
+                (source, cursor),
+            )
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:

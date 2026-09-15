@@ -62,14 +62,43 @@ class Control:
                 scope TEXT NOT NULL CHECK(scope IN ('service','global','unknown')));
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
             INSERT OR IGNORE INTO metadata VALUES ('generation','1');
+            CREATE TABLE IF NOT EXISTS discord_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL,
+                service_id TEXT NOT NULL, body TEXT NOT NULL);
         """)
 
     @staticmethod
     def _put(db: sqlite3.Connection, kind: str, object_id: str, body: JsonValue) -> None:
+        encoded = canonical(body)
+        old = db.execute(
+            "SELECT body FROM objects WHERE kind=? AND id=?", (kind, object_id)
+        ).fetchone()
+        if kind == "case" and isinstance(body, dict) and (old is None or old[0] != encoded):
+            plans = db.execute(
+                "SELECT id FROM objects WHERE kind='plan' AND json_extract(body,'$.case_id')=? "
+                "AND json_extract(body,'$.status')='DRAFT' ORDER BY id LIMIT 5",
+                (object_id,),
+            ).fetchall()
+            summary = "案件の状態が更新されました。詳細は本体で確認してください。"
+            if plans:
+                summary += "\n確認待ち計画: " + ", ".join(row[0] for row in plans)
+            # Keep raw evidence, titles derived from logs, and LLM prose off Discord.
+            snapshot: JsonValue = {
+                "case_id": object_id,
+                "title": "OpSyne 案件更新",
+                "state": body.get("status", "UNKNOWN"),
+                "summary": summary,
+                "observed_at": body.get("updated_at"),
+                "evidence_refs": [],
+            }
+            db.execute(
+                "INSERT INTO discord_events(event_id,service_id,body) VALUES (?,?,?)",
+                (identifier("discord"), body["service_id"], canonical(snapshot)),
+            )
         db.execute(
             "INSERT INTO objects VALUES (?,?,?) "
             "ON CONFLICT(kind,id) DO UPDATE SET body=excluded.body",
-            (kind, object_id, canonical(body)),
+            (kind, object_id, encoded),
         )
 
     @staticmethod
@@ -376,7 +405,15 @@ class Control:
             self._put(db, "case", case_id, case.model_dump(mode="json"))
 
     def create_plan(
-        self, case_id: str, capability_id: str, reason: str, proposer: str, now: float | None = None
+        self,
+        case_id: str,
+        capability_id: str,
+        reason: str,
+        proposer: str,
+        now: float | None = None,
+        *,
+        task_id: str | None = None,
+        proposal_key: str | None = None,
     ) -> dict[str, Any]:
         at = time.time() if now is None else now
         with self.db.connection() as db:
@@ -411,6 +448,8 @@ class Control:
             )
             plan = plan.model_copy(update={"digest": plan_digest(plan)})
             body = {**plan.model_dump(mode="json"), "status": "DRAFT", "approver": None}
+            if task_id is not None:
+                body.update(proposal_task_id=task_id, proposal_key=proposal_key)
             self._put(db, "plan", plan.id, body)
             self._audit(db, proposer, "plan.propose", plan.id, plan.digest)
             case = case.model_copy(update={"status": "AWAITING_APPROVAL", "updated_at": at})
@@ -455,7 +494,13 @@ class Control:
             raise Denied("計画の期限・対象・操作能力が現在の状態と一致しません")
 
     def approve(
-        self, plan_id: str, expected_digest: str, actor: Actor, now: float | None = None
+        self,
+        plan_id: str,
+        expected_digest: str,
+        actor: Actor,
+        now: float | None = None,
+        *,
+        run_recovery: bool = False,
     ) -> dict[str, Any]:
         at = time.time() if now is None else now
         if actor.role not in {"admin", "approver"}:
@@ -463,34 +508,109 @@ class Control:
         with self.db.connection() as db:
             body = self._get(db, "plan", plan_id)
             plan = self.plan_model(body)
-            self._current(db, plan, at)
-            if plan.proposer == actor.actor:
-                raise Denied("提案者本人は承認できません。別の承認者を使用してください")
-            if body["status"] != "DRAFT" or not hmac.compare_digest(plan.digest, expected_digest):
-                raise Conflict("固定された計画のdigestと状態を確認してください")
-            generation = int(
-                db.execute("SELECT value FROM metadata WHERE key='generation'").fetchone()[0]
-            )
-            body.update(
-                status="APPROVED", approver=actor.actor, approved_at=at, generation=generation
-            )
-            self._put(db, "plan", plan_id, body)
-            self._audit(db, actor.actor, "plan.approve", plan_id, plan.digest)
+            if run_recovery:
+                existing = db.execute(
+                    "SELECT body FROM objects WHERE kind='recovery' AND id=?", (plan_id,)
+                ).fetchone()
+                if existing is not None:
+                    job = json.loads(existing["body"])
+                    if job["approver"] != actor.actor or job["digest"] != expected_digest:
+                        raise Conflict("別の承認または計画の実行要求です")
+                    return body
+            body = self._approve(db, plan_id, expected_digest, actor, at)
+            if run_recovery:
+                self._put(
+                    db,
+                    "recovery",
+                    plan_id,
+                    {
+                        "id": plan_id,
+                        "plan_id": plan_id,
+                        "case_id": plan.case_id,
+                        "service_id": plan.service_id,
+                        "digest": plan.digest,
+                        "approver": actor.actor,
+                        "executor": "system:recovery",
+                        "status": "QUEUED",
+                        "execution_id": None,
+                        "detail": "承認済み。サーバーで復旧処理を開始します。",
+                        "updated_at": at,
+                    },
+                )
             return body
+
+    def _approve(
+        self, db: sqlite3.Connection, plan_id: str, expected_digest: str, actor: Actor, at: float
+    ) -> dict[str, Any]:
+        if actor.role not in {"admin", "approver"}:
+            raise Denied("承認権限が必要です")
+        body = self._get(db, "plan", plan_id)
+        plan = self.plan_model(body)
+        self._current(db, plan, at)
+        if plan.proposer == actor.actor:
+            raise Denied("提案者本人は承認できません。別の承認者を使用してください")
+        if body["status"] != "DRAFT" or not hmac.compare_digest(plan.digest, expected_digest):
+            raise Conflict("固定された計画のdigestと状態を確認してください")
+        generation = int(
+            db.execute("SELECT value FROM metadata WHERE key='generation'").fetchone()[0]
+        )
+        body.update(status="APPROVED", approver=actor.actor, approved_at=at, generation=generation)
+        self._put(db, "plan", plan_id, body)
+        self._audit(db, actor.actor, "plan.approve", plan_id, plan.digest)
+        return body
+
+    def update_recovery(
+        self, plan_id: str, status: str, detail: str, execution_id: str | None = None
+    ) -> dict[str, Any]:
+        with self.db.connection() as db:
+            body = self._get(db, "recovery", plan_id)
+            body.update(status=status, detail=detail[:2000], updated_at=time.time())
+            if execution_id:
+                body["execution_id"] = execution_id
+            self._put(db, "recovery", plan_id, body)
+            self._audit(
+                db,
+                "system:recovery",
+                "recovery.progress",
+                plan_id,
+                status,
+                service_id=body["service_id"],
+                object_kind="plan",
+            )
+            return body
+
+    def authorize_recovery(self, plan_id: str) -> None:
+        with self.db.connection() as db:
+            job = self._get(db, "recovery", plan_id)
+            plan = self._get(db, "plan", plan_id)
+            if (
+                job["status"] not in {"QUEUED", "EXECUTING"}
+                or job["digest"] != plan["digest"]
+                or job["approver"] != plan.get("approver")
+                or job["executor"] != "system:recovery"
+            ):
+                raise Denied("この固定計画を実行する承認がありません")
 
     def reject(self, plan_id: str, actor: Actor, reason: str) -> dict[str, Any]:
         if actor.role not in {"admin", "approver"}:
             raise Denied("承認権限が必要です")
         with self.db.connection() as db:
-            body = self._get(db, "plan", plan_id)
-            if db.execute("SELECT 1 FROM claims WHERE plan_id=?", (plan_id,)).fetchone():
-                raise Conflict("操作結果の確認が必要です")
-            if body["status"] not in {"DRAFT", "APPROVED"}:
-                raise Conflict("この状態の計画は却下できません")
-            body.update(status="REJECTED", rejection_reason=reason[:2000])
-            self._put(db, "plan", plan_id, body)
-            self._audit(db, actor.actor, "plan.reject", plan_id, reason)
-            return body
+            return self._reject(db, plan_id, actor, reason)
+
+    def _reject(
+        self, db: sqlite3.Connection, plan_id: str, actor: Actor, reason: str
+    ) -> dict[str, Any]:
+        if actor.role not in {"admin", "approver"}:
+            raise Denied("承認権限が必要です")
+        body = self._get(db, "plan", plan_id)
+        if db.execute("SELECT 1 FROM claims WHERE plan_id=?", (plan_id,)).fetchone():
+            raise Conflict("操作結果の確認が必要です")
+        if body["status"] not in {"DRAFT", "APPROVED"}:
+            raise Conflict("この状態の計画は却下できません")
+        body.update(status="REJECTED", rejection_reason=reason[:2000])
+        self._put(db, "plan", plan_id, body)
+        self._audit(db, actor.actor, "plan.reject", plan_id, reason)
+        return body
 
     def issue_permit(self, plan_id: str, now: float | None = None) -> ExecutionPermit:
         at = time.time() if now is None else now
