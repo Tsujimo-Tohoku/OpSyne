@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
+from opsyne.contracts.adapter_reviews import ReviewText
 from opsyne.contracts.cases import EvidenceClaim
 from opsyne.contracts.core import Model, Service
 from opsyne.contracts.observations import (
@@ -59,6 +60,7 @@ class AdapterProposal(ProposalModel):
     severity_map: list[SeverityMapping] = Field(max_length=100)
     rationale: list[EvidenceClaim] = Field(min_length=1, max_length=30)
     unknowns: list[str] = Field(max_length=50)
+    suggested_use: ReviewText | None = None
 
     @model_validator(mode="after")
     def consistent_proposal(self) -> AdapterProposal:

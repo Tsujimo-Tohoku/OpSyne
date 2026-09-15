@@ -7,6 +7,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from opsyne.api.app import create_app
+from opsyne.contracts.adapter_reviews import HumanExplanation
 from opsyne.contracts.core import Actor, Service
 from opsyne.contracts.execution import Execution
 from opsyne.contracts.observations import Source
@@ -218,3 +219,33 @@ def test_service_history_traces_approval_execution_and_verification(tmp_path: Pa
             "/api/services/demo-checkout/items/executions", headers=headers(tmp_path)
         ).json()
         assert executions["items"][0]["verification"]["status"] == "PASS"
+
+
+def test_adapter_explanation_editor_is_waiting_and_explanation_is_preserved(tmp_path: Path) -> None:
+    runtime = Runtime(tmp_path)
+    app = create_app(runtime=runtime, background=False)
+    owner = Actor(actor="owner", role="admin")
+    runtime.seed_demo(owner)
+    draft = runtime.control.get("adapter", "demo-json-v1")
+    updated = runtime.adapters.update_explanation(
+        draft["id"], draft["digest"], HumanExplanation(monitoring_purpose="決済失敗の検知"), owner
+    )
+    with TestClient(app) as client:
+        page = client.get(
+            "/api/services/demo-checkout/items/approvals", headers=headers(tmp_path, "owner")
+        ).json()
+        adapter = next(item for item in page["items"] if item["kind"] == "adapter")
+        assert adapter["definition"] == updated
+        assert adapter["review"] == {
+            "can_review": False,
+            "reason": "self_authored",
+            "authorization_required": True,
+        }
+        events = client.get(
+            "/api/services/demo-checkout/items/history", headers=headers(tmp_path)
+        ).json()
+        edited = next(
+            item for item in events["items"] if item["action"] == "adapter.explanation.update"
+        )
+        assert edited["object_kind"] == "adapter"
+        assert edited["current_object"]["digest"] == updated["digest"]
