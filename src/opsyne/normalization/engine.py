@@ -61,6 +61,17 @@ def _map_key(value: object) -> str | None:
     return None
 
 
+def missing_adapter_paths(raw: RawEvent, adapter: AdapterDefinition) -> list[str]:
+    """Validate declared paths separately from intentionally unknown semantic values."""
+    try:
+        document = json.loads(
+            raw.payload, parse_constant=_reject_nonfinite, parse_float=_json_float
+        )
+    except (ValueError, RecursionError):
+        return list(adapter.fields.values())
+    return [path for path in adapter.fields.values() if _lookup(document, path) is _MISSING]
+
+
 def normalize(
     raw: RawEvent,
     adapters: Sequence[AdapterDefinition],

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import time
 from collections.abc import Callable
 from typing import Any
@@ -51,6 +53,34 @@ class AdapterRegistry:
             {k: v for k, v in body.items() if k in AdapterDefinition.model_fields}
         )
 
+    def _overlap(self, db: sqlite3.Connection, definition: AdapterDefinition) -> None:
+        for row in db.execute("SELECT body FROM objects WHERE kind='adapter'"):
+            other = json.loads(row[0])
+            if other["status"] != "APPROVED" or other["source_id"] != definition.source_id:
+                continue
+            active = self.definition(other)
+            if (active.target_instance_id, active.target_version) != (
+                definition.target_instance_id,
+                definition.target_version,
+            ):
+                continue
+            separated = any(
+                key in active.conditions
+                and (
+                    type(active.conditions[key]) is not type(value)
+                    or active.conditions[key] != value
+                )
+                for key, value in definition.conditions.items()
+            )
+            if not separated:
+                raise Conflict("有効な定義と適用範囲が重なります。失効または条件の限定が必要です")
+
+    def validate_candidate(self, definition: AdapterDefinition) -> None:
+        """Check current binding and active overlaps without saving or activating a draft."""
+        self._binding(definition)
+        with self.control.db.connection() as db:
+            self._overlap(db, definition)
+
     def approve(self, adapter_id: str, expected_digest: str, actor: Actor) -> dict[str, Any]:
         if actor.role not in {"admin", "approver"}:
             raise Denied("変換定義の承認権限が必要です")
@@ -66,26 +96,7 @@ class AdapterRegistry:
                 raise Denied("変換定義の提案者本人は承認できません")
             if digest(definition.model_dump(mode="json")) != expected_digest:
                 raise Denied("変換定義の内容が変更されています")
-            for row in db.execute("SELECT body FROM objects WHERE kind='adapter'"):
-                import json
-
-                other = json.loads(row[0])
-                if other["status"] != "APPROVED" or other["source_id"] != definition.source_id:
-                    continue
-                active = self.definition(other)
-                if (active.target_instance_id, active.target_version) != (
-                    definition.target_instance_id,
-                    definition.target_version,
-                ):
-                    continue
-                separated = any(
-                    k in active.conditions and active.conditions[k] != v
-                    for k, v in definition.conditions.items()
-                )
-                if not separated:
-                    raise Conflict(
-                        "有効な定義と適用範囲が重なります。失効または条件の限定が必要です"
-                    )
+            self._overlap(db, definition)
             body.update(status="APPROVED", approver=actor.actor, approved_at=time.time())
             self.control._put(db, "adapter", adapter_id, body)
             self.control._audit(db, actor.actor, "adapter.approve", adapter_id, expected_digest)

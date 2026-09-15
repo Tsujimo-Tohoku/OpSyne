@@ -50,6 +50,11 @@ def create_app(
         api_key=os.environ.get("OPENAI_API_KEY"),
         daily_call_limit=int(os.environ.get("OPSYNE_DAILY_LLM_CALLS", "20")),
         auto_investigate=os.environ.get("OPSYNE_AUTO_INVESTIGATE", "false").lower() == "true",
+        auto_adapter_proposals=os.environ.get("OPSYNE_AUTO_ADAPTER_PROPOSALS", "true").lower()
+        == "true",
+        adapter_coalesce_seconds=int(os.environ.get("OPSYNE_ADAPTER_COALESCE_SECONDS", "5")),
+        adapter_retry_seconds=int(os.environ.get("OPSYNE_ADAPTER_RETRY_SECONDS", "900")),
+        adapter_max_attempts=int(os.environ.get("OPSYNE_ADAPTER_MAX_ATTEMPTS", "3")),
     )
     tokens = AccessTokens(state.data_dir / "tokens.json")
 
@@ -189,7 +194,8 @@ def create_app(
 
     @app.post("/api/services")
     def service(body: Service, actor: Actor = administration) -> Service:
-        return state.control.register_service(body, actor.actor)
+        with state._lock:
+            return state.control.register_service(body, actor.actor)
 
     @app.get("/api/checks", dependencies=[Depends(identity)])
     def checks() -> list[dict[str, Any]]:
@@ -203,7 +209,8 @@ def create_app(
 
     @app.post("/api/services/{service_id}/check")
     def set_check(service_id: str, body: CheckConfig, actor: Actor = administration) -> CheckConfig:
-        state.control.set_check(service_id, body, actor.actor)
+        with state._lock:
+            state.control.set_check(service_id, body, actor.actor)
         return body
 
     @app.post("/api/services/{service_id}/verify")
@@ -212,10 +219,11 @@ def create_app(
 
     @app.post("/api/sources")
     def source(body: Source, actor: Actor = administration) -> Source:
-        state.control.service(body.service_id)
-        result = state.collector.register_source(body)
-        state.control.audit(actor.actor, "source.register", body.id, body.kind)
-        return result
+        with state._lock:
+            state.control.service(body.service_id)
+            result = state.collector.register_source(body)
+            state.control.audit(actor.actor, "source.register", body.id, body.kind)
+            return result
 
     @app.post("/api/sources/{source_id}/ingest")
     def ingest(source_id: str, body: Ingest, actor: Actor = editing) -> dict[str, Any]:
@@ -249,7 +257,7 @@ def create_app(
 
     @app.post("/api/cases/{case_id}/adapter-proposal")
     def suggest_adapter(case_id: str, actor: Actor = editing) -> dict[str, Any]:
-        task = state.control.enqueue(case_id, "adapter")
+        task = state.discoveries.request(case_id)
         state.control.audit(actor.actor, "adapter.investigation.request", task.id, case_id)
         return task.model_dump(mode="json")
 
@@ -289,7 +297,7 @@ def create_app(
             validation = state.validate_adapter(adapter_id)
             if validation["supported_count"] == 0:
                 raise Conflict(
-                    "保持した直近20件の原本に対応する標本がありません。定義と入力を確認してください"
+                    "保持した原本に対応する標本がありません。定義と入力を確認してください"
                 )
             state.control.audit(
                 actor.actor, "adapter.validate", adapter_id, str(validation["sample_count"])

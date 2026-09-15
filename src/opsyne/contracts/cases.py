@@ -47,6 +47,11 @@ class Task(Model):
     expires_at: float
     detail: str = ""
     attempts: int = 0
+    discovery_id: str | None = None
+    automatic: bool = False
+    evidence_ids: tuple[str, ...] = Field(default=(), max_length=20)
+    target_instance_id: str | None = None
+    target_version: int | None = Field(default=None, ge=1)
 
 
 class EvidenceGrant(Model):

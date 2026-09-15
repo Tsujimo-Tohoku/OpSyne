@@ -459,12 +459,21 @@ class Control:
         self,
         case_id: str,
         role: Literal["operator", "sre", "security", "adapter", "periodic"] = "operator",
+        *,
+        discovery_id: str | None = None,
+        evidence_ids: tuple[str, ...] = (),
+        target_instance_id: str | None = None,
+        target_version: int | None = None,
     ) -> Task:
         with self.db.connection() as db:
             case = Case.model_validate(self._get(db, "case", case_id))
             for row in db.execute("SELECT body FROM objects WHERE kind='task'"):
                 task = Task.model_validate_json(row[0])
-                if task.case_id == case_id and task.status in {"PENDING", "RUNNING"}:
+                if (
+                    task.case_id == case_id
+                    and task.role == role
+                    and task.status in {"PENDING", "RUNNING"}
+                ):
                     return task
             at = time.time()
             task = Task(
@@ -474,12 +483,27 @@ class Control:
                 role=role,
                 created_at=at,
                 expires_at=at + 300,
+                discovery_id=discovery_id,
+                evidence_ids=evidence_ids,
+                target_instance_id=target_instance_id,
+                target_version=target_version,
             )
             self._put(db, "task", task.id, task.model_dump(mode="json"))
             self._audit(db, "control", "task.enqueue", task.id, case_id)
             return task
 
-    def claim_task(self, daily_limit: int) -> Task | None:
+    def contains_evidence(self, case_id: str, evidence_ids: tuple[str, ...]) -> bool:
+        """Check durable membership, independent of the case's recent display window."""
+        with self.db.connection() as db:
+            return all(
+                db.execute(
+                    "SELECT 1 FROM case_evidence WHERE case_id=? AND raw_id=?", (case_id, raw_id)
+                ).fetchone()
+                is not None
+                for raw_id in evidence_ids
+            )
+
+    def claim_task(self, daily_limit: int, *, allow_auto_adapters: bool = True) -> Task | None:
         at = time.time()
         day = time.strftime("%Y-%m-%d", time.gmtime(at))
         with self.db.connection() as db:
@@ -494,6 +518,8 @@ class Control:
                     )
                     self._put(db, "task", task.id, task.model_dump(mode="json"))
                 if task.status != "PENDING":
+                    continue
+                if task.automatic and not allow_auto_adapters:
                     continue
                 budget = db.execute("SELECT calls FROM budget WHERE day=?", (day,)).fetchone()
                 reason = "期限切れ" if task.expires_at <= at else ""
@@ -521,16 +547,32 @@ class Control:
             )
             self._put(db, "task", task.id, saved.model_dump(mode="json"))
             if analysis is not None:
-                self._put(
-                    db,
-                    "analysis",
-                    task.case_id,
-                    {
-                        **analysis.model_dump(mode="json"),
-                        "task_id": task.id,
-                        "created_at": time.time(),
-                    },
-                )
+                report = {
+                    **analysis.model_dump(mode="json"),
+                    "task_id": task.id,
+                    "task_role": task.role,
+                    "created_at": time.time(),
+                }
+                self._put(db, "task_analysis", task.id, report)
+                replace_summary = task.role != "adapter"
+                if task.role == "adapter":
+                    self._put(db, "adapter_analysis", task.case_id, report)
+                    try:
+                        previous = self._get(db, "analysis", task.case_id)
+                    except KeyError:
+                        replace_summary = True
+                    else:
+                        previous_role = previous.get("task_role")
+                        if previous_role is None and previous.get("task_id"):
+                            try:
+                                previous_task = self._get(db, "task", previous["task_id"])
+                            except KeyError:
+                                pass
+                            else:
+                                previous_role = previous_task.get("role")
+                        replace_summary = previous_role == "adapter"
+                if replace_summary:
+                    self._put(db, "analysis", task.case_id, report)
             self._audit(db, f"agent:{task.role}", "task.finish", task.id, saved.status)
 
     def recover_tasks(self) -> int:

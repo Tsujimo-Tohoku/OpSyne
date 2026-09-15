@@ -28,7 +28,7 @@ LLM調査と未知ログの変換提案には `OPENAI_API_KEY` が必要です�
 
 - 原本・取得位置・送信待ちの永続化、重複排除、ファイル回転・切詰め・観測不足の記録。
 - 版と対象を固定した宣言的な変換定義、未知状態、機械検知、証拠付き案件。
-- 案件の証拠範囲を制限・マスクしたLLM調査と変換提案。提案は承認待ちとして保存。
+- 案件の証拠範囲を制限・マスクしたLLM調査。未知JSON形式をまとめて変換案を自動生成し、標本・重複検証後に承認待ちとして保存。
 - 別主体による固定計画の承認、実行直前の再照合、短命の署名付き許可、実行台帳、独立した確認。
 - 合成デモと、管理者が登録するHTTP操作／GET確認。結果不明の操作は `UNKNOWN` のまま保持。
 - ローカルダッシュボード、役割別トークン、監査記録、停止中のバックアップと復元後の操作保留。
@@ -43,8 +43,10 @@ SQLiteと同一プロセス内のワーカーを使う小規模構成です。�
 - [責任と依存の境界](docs/architecture-boundaries.md)、[段階計画と受入条件](docs/development-plan.md)。
 - [ADR](docs/adr/0001-development-foundation.md): 初期技術選定と未決事項。
 - [ローカル製品の技術選定](docs/adr/0002-local-product.md): 保存、API、LLM、認可と配備上の制約。
+- [変換案の自動生成](docs/adr/0003-automatic-adapter-proposals.md): 同形式の集約、再試行と予算、承認境界。
 - [初期検証記録](docs/setup-verification.md): 開発環境構築時の記録。現在の製品全体の検証結果とは区別します。
-- [v0.1検証記録](docs/implementation-verification.md): 自動テスト160件、画面・配布物の確認と未確認範囲。
+- [v0.1検証記録](docs/implementation-verification.md): 自動テスト230件、画面・配布物の確認と未確認範囲。
+- [実LLM E2E](docs/live-llm-e2e.md): Luna実APIでの検証結果と、明示的に実行する再検証コマンド。
 - Ruff、mypy、import-linter、pytest、GitHub Actions、Issue/PRテンプレート。
 
 ## 構成

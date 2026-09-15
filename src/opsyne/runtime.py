@@ -21,10 +21,12 @@ from opsyne.contracts.core import Actor, Service
 from opsyne.contracts.execution import Capability, CheckConfig, Execution, VerificationResult
 from opsyne.contracts.observations import AdapterDefinition, Finding, RawEvent, RawInput, Source
 from opsyne.control.adapters import AdapterRegistry
-from opsyne.control.repository import Control, Denied
+from opsyne.control.discovery import AdapterDiscovery
+from opsyne.control.repository import Conflict, Control, Denied
 from opsyne.detection.engine import detect, detect_coverage
 from opsyne.gateway.service import EvidenceGateway
-from opsyne.normalization.engine import normalize
+from opsyne.normalization.engine import missing_adapter_paths, normalize
+from opsyne.normalization.formats import format_fingerprint, supported_json
 from opsyne.runner.service import Runner
 from opsyne.storage.instance import InstanceLock
 from opsyne.verification.service import VerificationService
@@ -37,6 +39,10 @@ class Runtime:
         api_key: str | None = None,
         daily_call_limit: int = 20,
         auto_investigate: bool = False,
+        auto_adapter_proposals: bool = True,
+        adapter_coalesce_seconds: int = 5,
+        adapter_retry_seconds: int = 900,
+        adapter_max_attempts: int = 3,
     ) -> None:
         self.data_dir = data_dir.resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -69,11 +75,22 @@ class Runtime:
         self.http = HttpConnector()
         self.verifier = VerificationService()
         self.adapters = AdapterRegistry(self.control, self.source)
+        self.discoveries = AdapterDiscovery(
+            self.control,
+            coalesce_seconds=adapter_coalesce_seconds,
+            retry_seconds=adapter_retry_seconds,
+            max_attempts=adapter_max_attempts,
+            source=self.source,
+        )
         self.investigator = Investigator(api_key=api_key, model="gpt-5.6-luna")
         self.adapter_agent = AdapterAgent(api_key=api_key, model="gpt-5.6-luna")
         self.llm_configured = bool(api_key)
         self.daily_call_limit = daily_call_limit
         self.auto_investigate = auto_investigate
+        self.auto_adapter_proposals = auto_adapter_proposals
+        self.adapter_coalesce_seconds = adapter_coalesce_seconds
+        self.adapter_retry_seconds = adapter_retry_seconds
+        self.adapter_max_attempts = adapter_max_attempts
         self.gateway = EvidenceGateway(self.collector.raw, self.validate_grant)
         self._stop = threading.Event()
         self._lock = threading.RLock()
@@ -159,6 +176,14 @@ class Runtime:
         self.control.record_event(raw.id, event.model_dump(mode="json"))
         if not reprocess:
             for finding in detect(event):
+                if finding.kind == "interpretation":
+                    fingerprint = format_fingerprint(raw, event, service)
+                    finding = finding.model_copy(
+                        update={"dedup_key": f"adapter-discovery:{fingerprint}"}
+                    )
+                    case = self._finding(finding)
+                    self.discoveries.observe(case, raw, service, fingerprint, supported_json(raw))
+                    continue
                 case = self._finding(finding)
                 if self.auto_investigate and self.llm_configured and case.status == "OPEN":
                     self.control.enqueue(
@@ -179,9 +204,15 @@ class Runtime:
             for coverage in self.collector.coverage():
                 for finding in detect_coverage(coverage):
                     self._finding(finding)
+            self.schedule_adapters()
             self.last_poll = time.time()
             self.last_poll_error = None
             return {"received": len(received), "processed": processed, "at": self.last_poll}
+
+    def schedule_adapters(self) -> list[Task]:
+        return self.discoveries.schedule(
+            enabled=self.auto_adapter_proposals, configured=self.llm_configured
+        )
 
     def reprocess(self, source_id: str) -> dict[str, int]:
         count = 0
@@ -198,6 +229,16 @@ class Runtime:
         definition = self.adapters.definition(body)
         source = self.source(definition.source_id)
         service = self.control.service(source.service_id)
+        try:
+            validation = self.control.get("adapter_validation", adapter_id)
+        except KeyError:
+            raw_samples = self.collector.search(source_id=source.id, limit=20)
+        else:
+            raw_samples = [
+                raw
+                for raw_id in validation["evidence_ids"]
+                if (raw := self.collector.raw(raw_id)) is not None and raw.source_id == source.id
+            ]
         samples = [
             normalize(
                 raw,
@@ -205,7 +246,7 @@ class Runtime:
                 target_instance_id=service.instance_id,
                 target_version=service.version,
             ).model_dump(mode="json")
-            for raw in self.collector.search(source_id=source.id, limit=20)
+            for raw in raw_samples
         ]
         return {
             "digest": body["digest"],
@@ -318,13 +359,24 @@ class Runtime:
             or not service.enabled
             or (task.case_id, task.service_id, task.role)
             != (grant.case_id, grant.service_id, grant.role)
-            or not set(grant.evidence_ids).issubset(case.evidence_ids)
+            or not self.control.contains_evidence(case.id, grant.evidence_ids)
+            or (task.evidence_ids and grant.evidence_ids != task.evidence_ids)
+            or (
+                task.target_instance_id is not None
+                and (service.instance_id, service.version)
+                != (task.target_instance_id, task.target_version)
+            )
         ):
             raise Denied("現在のtaskまたは案件の証拠範囲が無効です")
 
     def run_task(self) -> Task | None:
-        task = self.control.claim_task(self.daily_call_limit)
+        self.schedule_adapters()
+        task = self.control.claim_task(
+            self.daily_call_limit,
+            allow_auto_adapters=self.auto_adapter_proposals and self.llm_configured,
+        )
         if task is None:
+            self.discoveries.schedule(enabled=False, configured=self.llm_configured)
             return None
         try:
             case = Case.model_validate(self.control.get("case", task.case_id))
@@ -333,7 +385,7 @@ class Runtime:
                 case_id=task.case_id,
                 service_id=task.service_id,
                 role=task.role,
-                evidence_ids=tuple(case.evidence_ids[:20]),
+                evidence_ids=task.evidence_ids or tuple(case.evidence_ids[:20]),
                 expires_at=task.expires_at,
             )
             evidence = self.gateway.retrieve(grant)
@@ -343,6 +395,8 @@ class Runtime:
             if task.role == "adapter":
                 source = self.source(case.source_id)
                 service = self.control.service(task.service_id)
+                if not source.enabled or source.service_id != service.id:
+                    raise Denied("変換調査の観測源が無効です")
                 proposal = self.adapter_agent.propose(task, evidence, source, service)
                 self.validate_grant(grant)
                 if (
@@ -353,7 +407,50 @@ class Runtime:
                 recommendations = []
                 if proposal.fields:
                     definition = proposal.to_definition(f"adapter-{task.id}", source, service)
-                    self.adapters.propose(definition, "agent:adapter")
+                    with self._lock:
+                        self.validate_grant(grant)
+                        if self.source(source.id) != source:
+                            raise Denied("変換調査中に観測源が変更されました")
+                        self.adapters.validate_candidate(definition)
+                        samples = []
+                        for raw_id in grant.evidence_ids:
+                            raw = self.collector.raw(raw_id)
+                            if raw is None or raw.source_id != source.id:
+                                raise Denied("変換案の標本が観測源と一致しません")
+                            if missing_adapter_paths(raw, definition):
+                                raise Conflict("変換案の参照パスが収集した標本に存在しません")
+                            samples.append(
+                                normalize(
+                                    raw,
+                                    [definition],
+                                    target_instance_id=service.instance_id,
+                                    target_version=service.version,
+                                )
+                            )
+                        if not samples or any(
+                            sample.parse_status not in {"KNOWN", "PARTIAL"} for sample in samples
+                        ):
+                            raise Conflict("変換案が収集した同形式の標本に対応していません")
+                        with self.control.db.connection() as db:
+                            self.control._put(
+                                db,
+                                "adapter_validation",
+                                definition.id,
+                                {
+                                    "task_id": task.id,
+                                    "evidence_ids": list(grant.evidence_ids),
+                                    "sample_count": len(samples),
+                                    "supported_count": len(samples),
+                                },
+                            )
+                            self.control._audit(
+                                db,
+                                "normalizer",
+                                "adapter.validate",
+                                definition.id,
+                                str(len(samples)),
+                            )
+                        self.adapters.propose(definition, "agent:adapter")
                     recommendations.append(f"変換定義 {definition.id} の内容・意味を確認して承認")
                 analysis = Analysis(
                     summary="変換定義を提案しました" if proposal.fields else "変換定義の提案を保留",
@@ -370,9 +467,12 @@ class Runtime:
             detail = (
                 "OPENAI_API_KEYが未設定です"
                 if not self.llm_configured
+                else str(exc)
+                if isinstance(exc, (Conflict, Denied))
                 else f"調査失敗: {type(exc).__name__}"
             )
             self.control.finish_task(task, None, detail)
+        self.discoveries.schedule(enabled=False, configured=self.llm_configured)
         return Task.model_validate(self.control.get("task", task.id))
 
     def case_detail(self, case_id: str) -> dict[str, Any]:
@@ -390,12 +490,18 @@ class Runtime:
             analysis = self.control.get("analysis", case_id)
         except KeyError:
             analysis = None
+        try:
+            adapter_analysis = self.control.get("adapter_analysis", case_id)
+        except KeyError:
+            adapter_analysis = None
         return {
             "case": case,
             "evidence": evidence,
             "plans": plans,
             "executions": [item for item in self.execution_list() if item["plan_id"] in ids],
             "analysis": analysis,
+            "adapter_analysis": adapter_analysis,
+            "adapter_discovery": self.discoveries.for_case(case_id),
         }
 
     def execution_list(self) -> list[dict[str, Any]]:
@@ -415,6 +521,7 @@ class Runtime:
             "plans": self.control.objects("plan")[:500],
             "executions": self.execution_list()[-500:],
             "adapters": self.control.objects("adapter"),
+            "adapter_discoveries": self.discoveries.all(),
             "coverage": [item.model_dump(mode="json") for item in self.collector.coverage()],
             "audit": self.control.audit_log(),
             "tasks": self.control.objects("task")[:200],
@@ -422,6 +529,10 @@ class Runtime:
                 "model": "gpt-5.6-luna",
                 "configured": self.llm_configured,
                 "daily_call_limit": self.daily_call_limit,
+                "auto_adapter_proposals": self.auto_adapter_proposals,
+                "adapter_coalesce_seconds": self.adapter_coalesce_seconds,
+                "adapter_retry_seconds": self.adapter_retry_seconds,
+                "adapter_max_attempts": self.adapter_max_attempts,
             },
             "worker": {
                 "last_poll": self.last_poll,

@@ -23,6 +23,7 @@ const statuses = {
   healthy: ["受信継続", "teal"], stale: ["受信遅延", "amber"], missing: ["未受信", "amber"], disabled: ["停止中", "outline"],
   KNOWN: ["解析済み", "teal"], PARTIAL: ["部分解析", "amber"], INVALID: ["解析失敗", "red"],
   RUNNING: ["進行中", "blue"], COMPLETED: ["完了", "teal"], DONE: ["完了", "teal"], BLOCKED: ["保留", "amber"],
+  COLLECTING: ["標本を収集中", "blue"], QUEUED: ["提案待ち", "amber"], COVERED: ["承認済み定義で対応", "teal"], RETRY_WAIT: ["再試行待ち", "amber"],
 };
 const roleNames = { admin: "管理者", operator: "運用担当", approver: "承認者", viewer: "閲覧者", agent: "Agent" };
 const taskRoleNames = { operator: "運用調査", sre: "信頼性調査", security: "セキュリティ調査", adapter: "変換定義の提案", periodic: "定期調査" };
@@ -309,10 +310,12 @@ function renderOverview() {
     workflow.append(steps); secondary.append(workflow);
   const llm = state.data?.llm;
   if (llm) {
-    const llmPanel = panel("調査モデル", "収集処理はモデルの稼働に依存しません");
+    const llmPanel = panel("調査・変換提案モデル", "収集処理はモデルの稼働に依存しません");
     const llmBody = el("div", "panel-body");
     append(llmBody, info([["モデル", llm.model || "未設定"], ["日次呼び出し上限", llm.daily_call_limit ?? "未設定"]]), llm.configured ? badge("ACTIVE") : el("span", "badge outline", "未設定"));
-    if (!llm.configured) llmBody.append(el("p", "field-hint", "API キーが未設定です。サーバー環境に OPENAI_API_KEY を設定して調査を有効にしてください。"));
+    llmBody.append(info([["未知形式の自動提案", autoAdapterStatus()]]));
+    llmBody.append(el("p", "field-hint", "未知形式をまとめて変換案を作成します。有効化には内容の確認と承認が必要です。"));
+    if (!llm.configured) llmBody.append(el("p", "field-hint", "API キーが未設定です。サーバー環境に OPENAI_API_KEY を設定すると、調査・変換案の生成を利用できます。"));
     llmPanel.append(llmBody); secondary.append(llmPanel);
   }
   if (!rows("services").length) {
@@ -383,6 +386,16 @@ function renderSources() {
 function renderAdapters() {
   const root = el("div");
   root.append(message("変換定義は原本の解釈に使います。定義の承認・再解析から、対象の操作が実行されることはありません。"));
+  const discoveries = rows("adapter_discoveries");
+  const automatic = panel("未知形式からの変換提案", "同じ構造のログをまとめ、標本と競合の検証後に承認待ちへ追加します", discoveries.length);
+  const automaticBody = el("div", "panel-body");
+  const llm = state.data?.llm;
+  append(automaticBody, info([["自動提案", autoAdapterStatus()], ["標本の収集時間", secondsLabel(llm?.adapter_coalesce_seconds)], ["再試行の最短間隔", secondsLabel(llm?.adapter_retry_seconds)], ["形式ごとの自動試行上限", llm?.adapter_max_attempts ?? "未取得"]]));
+  if (!llm?.configured) automaticBody.append(message("API キーが未設定のため、LLMによる変換案の生成は行われません。未知形式の収集状態は引き続き確認できます。", "warning"));
+  if (!discoveries.length) automaticBody.append(empty("未知形式のグループはありません", "新しく検知した未知形式がここに表示されます。自動提案が有効なら、標本をまとめて生成を開始します。", "⇄"));
+  else for (const discovery of discoveries) automaticBody.append(discoveryCard(discovery, true));
+  automatic.append(automaticBody); root.append(automatic);
+  root.append(append(el("div", "list-section-heading"), el("h2", "", `変換定義 (${rows("adapters").length})`)));
   if (!rows("adapters").length) root.append(append(el("div", "panel"), empty("変換定義は未登録です", "JSON の項目対応と値の意味を定義します。適用範囲と版を確認し、承認すると有効になります。", "⇄")));
   const grid = el("div", "source-grid");
   for (const record of rows("adapters")) {
@@ -392,6 +405,38 @@ function renderAdapters() {
     card.append(append(el("div", "card-actions"), button("定義を確認", () => openAdapter(record), "button small"))); grid.append(card);
   }
   root.append(grid); return root;
+}
+function secondsLabel(value) {
+  if (!Number.isFinite(value)) return "未取得";
+  return value >= 60 && value % 60 === 0 ? `${value / 60}分` : `${value}秒`;
+}
+function autoAdapterStatus() {
+  const llm = state.data?.llm;
+  if (!llm?.configured) return "API キー未設定";
+  if (llm.auto_adapter_proposals === true) return "有効 · 有効化には承認が必要";
+  if (llm.auto_adapter_proposals === false) return "停止中";
+  return "未取得";
+}
+function discoveryCard(discovery, showCase = false) {
+  const card = el("article", "plan-card");
+  append(card, append(el("div", "plan-card-header"), el("h4", "", sourceName(discovery.source_id)), badge(discovery.status)),
+    info([["まとめたログ", `${discovery.event_count ?? 0}件`], ["生成の試行", `${discovery.attempts ?? 0}回`], ["参照する標本", `${discovery.evidence_ids?.length ?? 0}件`], ["次の試行予定", ["COLLECTING", "RETRY_WAIT"].includes(discovery.status) && discovery.next_attempt_at ? date(discovery.next_attempt_at, true) : "—"]]));
+  if (discovery.detail) card.append(el("p", "analysis-text", discovery.detail));
+  if (discovery.status === "RETRY_WAIT") card.append(el("p", "field-hint", "自動再試行は、待機時間が過ぎて新しい標本が届いた後に行います。案件から手動で再提案することもできます。"));
+  if (discovery.status === "AWAITING_APPROVAL") card.append(el("p", "field-hint", "変換案を保存しました。項目・値の意味・適用範囲を確認して承認すると有効になります。"));
+  const actions = el("div", "card-actions");
+  if (showCase && discovery.case_id) actions.append(button("案件と標本を確認", () => openCase(discovery.case_id), "button small"));
+  const draft = rows("adapters").find((record) => adapterObject(record).id === discovery.adapter_id);
+  if (draft) actions.append(button(draft.status === "DRAFT" ? "変換案を確認・承認" : "変換定義を確認", () => openAdapter(draft), "button small"));
+  if (actions.childElementCount) card.append(actions);
+  card.append(jsonDetails("形式グループの詳細", discovery));
+  return card;
+}
+function configureProposalButton(node, discovery, caseId) {
+  const active = ["QUEUED", "RUNNING"].includes(discovery?.status) || rows("tasks").some((task) => task.case_id === caseId && task.role === "adapter" && ["PENDING", "RUNNING"].includes(task.status));
+  node.textContent = active ? "変換案の生成を待機中" : discovery?.attempts > 0 ? "変換案を再提案" : "変換案を手動生成";
+  node.disabled = !can("operate") || !state.data?.llm?.configured || active || node.getAttribute("aria-busy") === "true";
+  node.title = !can("operate") ? "運用担当または管理者の権限が必要です" : !state.data?.llm?.configured ? "API キーが未設定です" : active ? "受付済みのタスクが完了するまでお待ちください" : "現在の標本から変換案を生成します。手動生成は自動再試行の待機時間・回数上限に関係なく要求できます。日次呼び出し上限は適用されます。";
 }
 function auditAction(entry) { return entry.action || entry.kind || entry.event || "操作記録"; }
 function activityList(entries) {
@@ -683,15 +728,24 @@ function renderCaseDetail(body, detail) {
   const item = detail.case; $("#dialog-title").textContent = item.title || item.id; body.replaceChildren();
   const statusNode = badge(item.status);
   append(body, append(el("div", "detail-topline"), severity(item.severity), statusNode, el("code", "detail-id", item.id)), info([["対象サービス", serviceName(item.service_id)], ["観測源", sourceName(item.source_id)], ["作成日時", date(item.created_at, true)], ["更新日時", date(item.updated_at, true)]]));
+  const proposalButton = button("変換案を手動生成", (event) => busy(event.currentTarget, async () => {
+    await api(`/cases/${safeId(item.id)}/adapter-proposal`, {}); toast("変換案の生成を受け付けました。標本と競合の検証後、承認待ちの定義として追加されます。"); await refresh(); await openCase(item.id);
+  }), "button", can("operate"));
+  configureProposalButton(proposalButton, detail.adapter_discovery, item.id);
+  proposalButton.addEventListener("opsyne:idle", () => configureProposalButton(proposalButton, state.caseLive?.discoveryValue ? JSON.parse(state.caseLive.discoveryValue) : detail.adapter_discovery, item.id));
   const actions = append(el("div", "detail-actions"), button("調査を実行", (event) => busy(event.currentTarget, async () => {
     await api(`/cases/${safeId(item.id)}/investigate`, {}); toast("調査タスクを受け付けました。完了後に調査結果へ反映されます。"); await refresh(); await openCase(item.id);
-  }), "button primary", can("operate")), button("変換定義の提案を依頼", (event) => busy(event.currentTarget, async () => {
-    await api(`/cases/${safeId(item.id)}/adapter-proposal`, {}); toast("変換定義の提案タスクを受け付けました。提案は変換定義画面で確認・承認できます。"); await refresh(); await openCase(item.id);
-  }), "button", can("operate")), button("対応計画を作成", () => planForm(item), "button", can("operate")), button("↻ 更新", () => openCase(item.id), "button"));
+  }), "button primary", can("operate")), proposalButton, button("対応計画を作成", () => planForm(item), "button", can("operate")), button("↻ 更新", () => openCase(item.id), "button"));
   body.append(section("対応を進める", actions));
+  const liveDiscovery = el("div");
+  if (detail.adapter_discovery) liveDiscovery.append(section("未知形式の変換提案", discoveryCard(detail.adapter_discovery)));
+  body.append(liveDiscovery);
   const liveTasks = el("div"); append(liveTasks, latestTask(item.id)); body.append(liveTasks);
   const analysis = detail.analysis || item.analysis;
   const liveAnalysis = section("調査結果", analysis ? renderAnalysis(analysis) : message("調査結果はまだ得られていません。根拠のある事実・仮説・不足情報を分けて記録します。")); body.append(liveAnalysis);
+  const liveAdapterAnalysis = el("div");
+  if (detail.adapter_analysis && detail.adapter_analysis.task_id !== analysis?.task_id) liveAdapterAnalysis.append(section("変換提案の根拠・不明点", renderAnalysis(detail.adapter_analysis)));
+  body.append(liveAdapterAnalysis);
   const evidence = Array.isArray(detail.evidence) ? detail.evidence : [];
   const evidenceSection = section(`根拠と原本 (${evidence.length})`);
   if (!evidence.length) evidenceSection.append(message("参照できる原本はありません。観測停止の案件などでは、収集状態が根拠になります。"));
@@ -711,7 +765,7 @@ function renderCaseDetail(body, detail) {
   const executionSection = section(`実行台帳と独立確認 (${executions.length})`);
   if (!executions.length) executionSection.append(el("p", "analysis-text", "実行記録はありません。操作の前に意図を永続化し、結果不明は照合まで保留します。"));
   for (const execution of executions) executionSection.append(executionCard(execution, item)); body.append(executionSection);
-  state.caseLive = { id: item.id, epoch: state.modalEpoch, analysis: liveAnalysis, analysisValue: JSON.stringify(analysis), tasks: liveTasks, tasksValue: JSON.stringify(rows("tasks")), status: statusNode };
+  state.caseLive = { id: item.id, epoch: state.modalEpoch, analysis: liveAnalysis, analysisValue: JSON.stringify(analysis), adapterAnalysis: liveAdapterAnalysis, adapterAnalysisValue: JSON.stringify([detail.adapter_analysis, analysis?.task_id]), tasks: liveTasks, tasksValue: JSON.stringify(rows("tasks")), status: statusNode, discovery: liveDiscovery, discoveryValue: JSON.stringify(detail.adapter_discovery), proposalButton };
 }
 function latestTask(caseId) {
   const tasks = rows("tasks").filter((task) => task.case_id === caseId).sort((left, right) => right.created_at - left.created_at);
@@ -731,10 +785,23 @@ async function refreshCaseSignals() {
     live.analysis.replaceChildren(el("h3", "", "調査結果"), analysis ? renderAnalysis(analysis) : message("調査結果はまだ記録されていません。"));
     live.analysisValue = serialized;
   }
+  const serializedAdapterAnalysis = JSON.stringify([detail.adapter_analysis, analysis?.task_id]);
+  if (serializedAdapterAnalysis !== live.adapterAnalysisValue && !live.adapterAnalysis.contains(document.activeElement)) {
+    live.adapterAnalysis.replaceChildren();
+    if (detail.adapter_analysis && detail.adapter_analysis.task_id !== analysis?.task_id) live.adapterAnalysis.append(section("変換提案の根拠・不明点", renderAnalysis(detail.adapter_analysis)));
+    live.adapterAnalysisValue = serializedAdapterAnalysis;
+  }
   const serializedTasks = JSON.stringify(rows("tasks"));
   if (serializedTasks !== live.tasksValue) {
     live.tasks.replaceChildren(); append(live.tasks, latestTask(live.id)); live.tasksValue = serializedTasks;
   }
+  const serializedDiscovery = JSON.stringify(detail.adapter_discovery);
+  if (serializedDiscovery !== live.discoveryValue && !live.discovery.contains(document.activeElement)) {
+    live.discovery.replaceChildren();
+    if (detail.adapter_discovery) live.discovery.append(section("未知形式の変換提案", discoveryCard(detail.adapter_discovery)));
+    live.discoveryValue = serializedDiscovery;
+  }
+  configureProposalButton(live.proposalButton, detail.adapter_discovery, live.id);
 }
 function renderAnalysis(analysis) {
   const wrapper = el("div");
