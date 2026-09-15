@@ -477,6 +477,7 @@ function openDialog(title, eyebrow = "WORKSPACE", wide = false) {
   state.modalEpoch += 1;
   state.caseLive = null;
   const dialog = $("#action-dialog"); dialog.classList.toggle("wide", wide);
+  dialog.classList.remove("recovery-review"); dialog.querySelector(".recovery-footer")?.remove();
   $("#dialog-title").textContent = title; $("#dialog-eyebrow").textContent = eyebrow;
   const content = $("#dialog-content"); content.replaceChildren();
   if (!dialog.open) dialog.showModal();
@@ -903,12 +904,15 @@ function planCard(record, item) {
   append(card, append(el("div", "plan-card-header"), el("h4", "", plan.capability_id || plan.id), badge(record.status || "DRAFT")), info([["対象 / 版", `${plan.target_instance_id} / v${plan.target_version}`], ["有効期限", date(plan.expires_at, true)], ["提案者", plan.proposer || record.proposed_by], ["提案理由", plan.reason]]));
   const actions = el("div", "card-actions");
   actions.append(button("固定計画を確認", () => reviewPlan(record, item), "button small"));
-  if (record.status === "APPROVED") actions.append(button("実行条件を確認・実行", () => reviewPlan(record, item, true), "button primary small", can("operate")));
+  if (record.status === "APPROVED") {
+    card.append(message("承認済みです。実行記録を確認し、未実行の場合は実行権限のある担当者が復旧処理を開始してください。"));
+    actions.append(button("復旧処理を開始", () => reviewPlan(record, item, true), "button primary small", can("operate")));
+  }
   card.append(actions); return card;
 }
 async function planForm(item) {
   const body = openDialog("対応計画を作成", "PROPOSE A PLAN"); const epoch = state.modalEpoch;
-  body.append(message("登録された型付き操作能力から選択します。保存した計画は別の主体が内容を確認し、承認後に実行できます。"));
+  body.append(message("登録済みの復旧操作を選び、実行する内容を計画として保存します。提案者とは別の管理者が承認すると、復旧処理と正常性の確認まで進みます。承認専用の担当者が承認した場合は、実行権限のある担当者が開始します。"));
   try {
     const response = await api("/capabilities");
     if (state.modalEpoch !== epoch) return;
@@ -924,11 +928,16 @@ async function planForm(item) {
 }
 function reviewPlan(record, item, execute = false) {
   const plan = planObject(record); const status = record.status || "DRAFT";
-  const body = openDialog(execute ? "固定計画を確認して実行" : "固定計画のレビュー", "PLAN REVIEW", true);
+  const runRecovery = execute || can("operate") && can("approve");
+  const body = openDialog(execute ? "復旧処理を開始" : "復旧計画を確認", "PLAN REVIEW", true);
+  $("#action-dialog").classList.add("recovery-review");
   const epoch = state.modalEpoch;
+  const session = state.session; const token = state.token;
+  const isCurrent = () => state.modalEpoch === epoch && $("#action-dialog").open && state.session === session && state.token === token;
   let operationReady = false;
   let updateApprovalState = () => {};
-  append(body, badge(status), info([["計画 ID", plan.id], ["提案者", plan.proposer], ["対象サービス", serviceName(plan.service_id)], ["対象実体 / 版", `${plan.target_instance_id} / v${plan.target_version}`], ["操作能力 / 版", `${plan.capability_id} / v${plan.capability_version}`], ["有効期限", date(plan.expires_at, true)]]));
+  const planStatus = append(el("div"), badge(status));
+  append(body, planStatus, info([["計画 ID", plan.id], ["提案者", plan.proposer], ["対象サービス", serviceName(plan.service_id)], ["対象実体 / 版", `${plan.target_instance_id} / v${plan.target_version}`], ["操作能力 / 版", `${plan.capability_id} / v${plan.capability_version}`], ["有効期限", date(plan.expires_at, true)]]));
   for (const [key, title] of [["reason", "対応理由"], ["impact", "想定される影響"], ["success_condition", "独立して確認する成功条件"], ["abort_condition", "中止条件"]]) body.append(section(title, el("p", "analysis-text", plan[key] || "未記録")));
   body.append(section("証拠参照", el("code", "", (plan.evidence_ids || []).join("\n") || "参照なし")));
   const operationSection = section("操作の内容", el("p", "analysis-text", "登録された操作能力の内容を取得しています…"));
@@ -943,30 +952,82 @@ function reviewPlan(record, item, execute = false) {
     }
     else operationSection.append(message("計画に記録された版の操作能力を取得できません。承認前に登録内容を確認してください。", "warning"));
   }).catch((error) => { if (state.modalEpoch === epoch) operationSection.replaceChildren(message(error.message, "error")); });
-  body.append(jsonDetails("承認対象の固定計画（すべてのフィールド）", plan, true));
+  body.append(jsonDetails("確認時の固定計画（すべてのフィールド）", plan));
   body.append(el("code", "digest", `SHA-256 ${plan.digest || "未記録"}`));
   const expired = Number(plan.expires_at) * 1000 <= Date.now();
   if (expired) body.append(message("この計画は期限切れです。新しい計画を作成して、改めて確認・承認してください。", "warning"));
   const isSelf = selfProposed(plan);
   if (status === "DRAFT" && isSelf) body.append(el("p", "role-note", "提案者は自己承認できません。別の承認主体で内容を確認してください。"));
-  if (execute && status === "APPROVED") body.append(message("実行直前に現在の対象・版・権限・承認期限と競合を再照合します。操作成功後も、独立確認が完了するまでは案件を解決しません。", "warning"));
+  if (runRecovery) body.append(message("確認した操作を実行し、その後にサービスの正常性を確認します。対象や設定の変更、期限切れ、実行条件の不一致があれば停止します。処理が終わるまでこの画面を開いたままにしてください。"));
+  else if (status === "DRAFT" && can("approve")) body.append(message("この役割では承認まで行えます。承認後、実行権限のある担当者が復旧処理を開始してください。"));
   if (status === "DRAFT" || (execute && status === "APPROVED")) {
+    const footer = el("div", "recovery-footer");
     const confirm = el("label", "check-line"); const checkbox = el("input"); checkbox.type = "checkbox";
-    append(confirm, checkbox, document.createTextNode(execute ? "固定計画の対象・操作・影響を確認しました。この計画の実行を要求します。" : "対象・版・根拠・影響・成功条件・中止条件・期限を確認しました。この固定計画を承認します。")); body.append(confirm);
+    append(confirm, checkbox, document.createTextNode(execute ? "対象・操作・影響・確認条件を確認しました。復旧処理を開始します。" : runRecovery ? "対象・操作・影響・成功条件・中止条件・期限を確認しました。この計画を承認し、復旧処理を開始します。" : "対象・版・根拠・影響・成功条件・中止条件・期限を確認しました。この固定計画を承認します。")); footer.append(confirm);
     const allowed = !expired && Boolean(plan.digest) && (execute ? can("operate") : can("approve") && !isSelf);
+    const progress = el("ol", "detail-list recovery-progress"); progress.hidden = true;
+    const steps = [el("li", "", execute ? "承認：承認済み" : "承認：待機中"), el("li", "", "復旧処理：待機中"), el("li", "", "復旧確認：待機中")];
+    append(progress, ...steps); progress.setAttribute("aria-label", "復旧の進捗"); body.append(progress);
+    const feedback = message(""); feedback.hidden = true; feedback.setAttribute("role", "status"); feedback.setAttribute("aria-live", "polite"); body.append(feedback);
     const actions = el("div", "form-actions");
-    if (!execute) actions.append(button("却下する", () => rejectForm(plan, item), "button danger", can("approve")));
-    const submit = button(execute ? "この計画を実行" : "この計画を承認", (event) => busy(event.currentTarget, async () => {
-      await api(`/plans/${safeId(plan.id)}/${execute ? "execute" : "approve"}`, execute ? {} : { digest: plan.digest });
-      toast(execute ? "実行要求を処理しました。台帳と独立確認の結果を確認してください。" : "固定計画を承認しました。実行時に現在の条件を照合します。");
-      await refresh(); await openCase(item.id);
+    let attempted = false;
+    const reject = !execute ? button("却下する", () => rejectForm(plan, item), "button danger", can("approve")) : null;
+    if (reject) actions.append(reject);
+    const showFeedback = (text, type = "info") => { feedback.textContent = text; feedback.className = `message ${type}`; feedback.hidden = false; feedback.scrollIntoView({ block: "nearest" }); };
+    const records = button("案件と実行記録を確認", (event) => busy(event.currentTarget, async () => { await refresh(); if (isCurrent()) await openCase(item.id); }));
+    records.hidden = true;
+    const submit = button(execute ? "復旧を実行して確認" : runRecovery ? "承認して復旧を実行" : "この計画を承認", (event) => busy(event.currentTarget, async () => {
+      if (attempted || !isCurrent()) return;
+      attempted = true; checkbox.disabled = true; confirm.hidden = true; if (reject) { reject.disabled = true; reject.hidden = true; }
+      progress.hidden = false; progress.scrollIntoView({ block: "nearest" });
+      let phase = execute ? 1 : 0;
+      try {
+        if (!execute) {
+          steps[0].textContent = "承認：処理中";
+          const approved = await api(`/plans/${safeId(plan.id)}/approve`, { digest: plan.digest }, token);
+          if (!isCurrent()) return;
+          if (approved?.status !== "APPROVED" || planObject(approved).id !== plan.id || planObject(approved).digest !== plan.digest) throw new Error("確認した計画の承認結果を取得できませんでした。");
+          steps[0].textContent = "承認：完了";
+          planStatus.replaceChildren(badge("APPROVED"));
+        }
+        if (!runRecovery) {
+          steps[1].textContent = "復旧処理：実行担当者の操作待ち";
+          showFeedback("計画を承認しました。実行権限のある担当者が「復旧処理を開始」から実行してください。");
+          return;
+        }
+        phase = 1; steps[1].textContent = "復旧処理：実行中";
+        const execution = await api(`/plans/${safeId(plan.id)}/execute`, {}, token);
+        if (!isCurrent()) return;
+        if (!execution?.id || execution.plan_id !== plan.id) throw new Error("この計画の実行記録を取得できませんでした。");
+        steps[1].textContent = `復旧処理：${statuses[execution.status]?.[0] || "結果不明"}`;
+        if (["SUCCEEDED", "FAILED"].includes(execution.status)) planStatus.replaceChildren(badge("EXECUTED"));
+        if (execution.status !== "SUCCEEDED") {
+          steps[2].textContent = "復旧確認：未実施";
+          showFeedback(execution.status === "FAILED" ? "復旧処理が失敗しました。実行記録で原因を確認してください。自動で再実行しません。" : "復旧処理の完了を確認できません。再実行せず、実行記録から操作結果を照合してください。", "warning");
+          return;
+        }
+        phase = 2; steps[2].textContent = "復旧確認：確認中";
+        const verification = await api(`/executions/${safeId(execution.id)}/verify`, {}, token);
+        if (!isCurrent()) return;
+        const verified = verification?.status === "PASS";
+        steps[2].textContent = `復旧確認：${verified ? "正常性を確認" : verification?.status === "FAIL" ? "復旧未完了" : "確認不能"}`;
+        showFeedback(verified ? "復旧処理が成功し、サービスが登録された正常性の条件を満たすことを確認しました。" : verification?.status === "FAIL" ? "操作は成功しましたが、サービスは正常性の条件を満たしていません。実行記録から原因を確認してください。" : "操作は成功しましたが、復旧を確認できません。実行記録から復旧確認をやり直してください。", verified ? "info" : "warning");
+      } catch (error) {
+        if (!isCurrent()) return;
+        steps[phase].textContent = `${["承認", "復旧処理", "復旧確認"][phase]}：結果を確認できません`;
+        if (phase < 2) steps[phase + 1].textContent = `${["承認", "復旧処理", "復旧確認"][phase + 1]}：未実施`;
+        const guidance = ["承認結果を確認できなかったため、復旧処理は要求していません。案件の最新状態を確認してください。", "復旧処理の結果を確認できません。再実行せず、実行記録と監査ログを確認してください。", "復旧処理は成功しましたが、復旧確認の結果を取得できません。実行記録から復旧確認をやり直してください。"][phase];
+        showFeedback(`${guidance}\n${error.message}`, "error");
+      } finally {
+        if (isCurrent()) { records.hidden = false; await refresh(); }
+      }
     }), "button primary", false);
     updateApprovalState = () => {
-      submit.disabled = submit.getAttribute("aria-busy") === "true" || !allowed || !checkbox.checked || !operationReady;
-      submit.title = !allowed ? "役割・提案者・有効期限を確認してください" : !operationReady ? "操作能力の内容を取得しています" : !checkbox.checked ? "内容を確認してチェックを入れてください" : "";
+      submit.disabled = attempted || submit.getAttribute("aria-busy") === "true" || !allowed || !checkbox.checked || !operationReady || Number(plan.expires_at) * 1000 <= Date.now();
+      submit.title = attempted ? "送信済みです。案件と実行記録を確認してください" : !allowed ? "役割・提案者・有効期限を確認してください" : !operationReady ? "操作能力の内容を取得しています" : !checkbox.checked ? "内容を確認してチェックを入れてください" : "";
     };
     updateApprovalState();
-    checkbox.addEventListener("change", updateApprovalState); submit.addEventListener("opsyne:idle", updateApprovalState); actions.append(submit); body.append(actions);
+    checkbox.addEventListener("change", updateApprovalState); submit.addEventListener("opsyne:idle", updateApprovalState); append(actions, submit, records); footer.append(actions); $("#action-dialog").append(footer);
   }
 }
 function rejectForm(plan, item) {
