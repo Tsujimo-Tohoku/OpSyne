@@ -6,7 +6,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -19,8 +19,10 @@ from opsyne.api.auth import AccessTokens
 from opsyne.contracts.core import Actor, Model, Service
 from opsyne.contracts.execution import Capability, CheckConfig
 from opsyne.contracts.observations import AdapterDefinition, RawInput, Source
+from opsyne.contracts.service_views import ServicePage, ServiceSummary
 from opsyne.control.repository import Conflict
 from opsyne.runtime import Runtime
+from opsyne.service_queries import Collection, ServiceQueries
 
 
 class Approval(Model):
@@ -57,6 +59,9 @@ def create_app(
         adapter_max_attempts=int(os.environ.get("OPSYNE_ADAPTER_MAX_ATTEMPTS", "3")),
     )
     tokens = AccessTokens(state.data_dir / "tokens.json")
+    service_queries = ServiceQueries(
+        state.control, state.collector.sources, state.collector.coverage, state.execution_list
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -184,6 +189,31 @@ def create_app(
     def schema() -> dict[str, Any]:
         return app.openapi()
 
+    @app.get("/api/services/{service_id}/overview")
+    def service_overview(service_id: str, actor: Actor = authentication) -> ServiceSummary:
+        return service_queries.summary(service_id, actor)
+
+    @app.get("/api/services/{service_id}/items/{collection}")
+    def service_items(
+        service_id: str,
+        collection: Collection,
+        actor: Actor = authentication,
+        limit: int = Query(default=50, ge=1, le=200),
+        cursor: str | None = Query(default=None, max_length=4096),
+    ) -> ServicePage:
+        return service_queries.page(service_id, collection, actor, limit, cursor)
+
+    @app.get("/api/history")
+    def unassigned_history(
+        scope: Literal["global", "unknown"],
+        actor: Actor = authentication,
+        limit: int = Query(default=50, ge=1, le=200),
+        cursor: str | None = Query(default=None, max_length=4096),
+    ) -> ServicePage:
+        return service_queries.paginate(
+            service_queries.history(None, scope), f"history/{scope}", actor, limit, cursor
+        )
+
     @app.get("/api/capabilities", dependencies=[Depends(identity)])
     def capabilities() -> list[dict[str, Any]]:
         return state.control.objects("capability")
@@ -222,6 +252,7 @@ def create_app(
         with state._lock:
             state.control.service(body.service_id)
             result = state.collector.register_source(body)
+            state.control.bind_source_scope(body.id, body.service_id)
             state.control.audit(actor.actor, "source.register", body.id, body.kind)
             return result
 

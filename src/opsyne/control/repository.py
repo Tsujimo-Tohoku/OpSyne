@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -55,6 +56,10 @@ class Control:
                 id INTEGER PRIMARY KEY, at REAL NOT NULL, actor TEXT NOT NULL,
                 action TEXT NOT NULL, object_id TEXT NOT NULL, detail TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS budget (day TEXT PRIMARY KEY, calls INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS audit_scope (
+                audit_id INTEGER PRIMARY KEY REFERENCES audit(id),
+                service_id TEXT, object_kind TEXT,
+                scope TEXT NOT NULL CHECK(scope IN ('service','global','unknown')));
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
             INSERT OR IGNORE INTO metadata VALUES ('generation','1');
         """)
@@ -79,16 +84,132 @@ class Control:
 
     @staticmethod
     def _audit(
-        db: sqlite3.Connection, actor: str, action: str, object_id: str, detail: str
+        db: sqlite3.Connection,
+        actor: str,
+        action: str,
+        object_id: str,
+        detail: str,
+        *,
+        service_id: str | None = None,
+        object_kind: str | None = None,
     ) -> None:
-        db.execute(
+        # Map only known event contracts, never IDs or prose heuristics.
+        kinds = {
+            "service.register": "service",
+            "demo.create": "service",
+            "check.register": "service",
+            "capability.register": "capability",
+            "case.evidence": "case",
+            "case.resolve": "case",
+            "plan.propose": "plan",
+            "plan.approve": "plan",
+            "plan.reject": "plan",
+            "permit.issue": "permit",
+            "execution.result": "plan",
+            "recovery.unsent_release": "plan",
+            "task.enqueue": "task",
+            "task.finish": "task",
+            "task.block": "task",
+            "task.manual": "task",
+            "investigation.request": "task",
+            "evidence.retrieve": "task",
+            "adapter.investigation.request": "task",
+            "adapter.propose": "adapter",
+            "adapter.approve": "adapter",
+            "adapter.validate": "adapter",
+            "adapter.revoke": "adapter",
+            "adapter.superseded": "adapter",
+            "adapter.explanation.update": "adapter",
+            "source.register": "source_scope",
+            "source.ingest": "source_scope",
+            "source.reprocess": "source_scope",
+            "adapter.discovery": "adapter_discovery",
+        }
+        object_kind = object_kind or kinds.get(action)
+        if service_id is None and object_kind:
+            try:
+                obj = Control._get(db, object_kind, object_id)
+                service_id = obj.get("service_id")
+                if object_kind == "service":
+                    service_id = obj["id"]
+                elif object_kind == "adapter":
+                    service_id = Control._get(db, "source_scope", obj["source_id"])["service_id"]
+            except KeyError:
+                pass
+        scope = (
+            "service"
+            if service_id
+            else "global"
+            if action
+            in {
+                "authorization.revoke_all",
+                "recovery.restore_acknowledged",
+                "poll.failed",
+                "worker.failed",
+            }
+            else "unknown"
+        )
+        row = db.execute(
             "INSERT INTO audit(at,actor,action,object_id,detail) VALUES (?,?,?,?,?)",
             (time.time(), actor, action, object_id, detail[:2000]),
         )
+        db.execute(
+            "INSERT INTO audit_scope VALUES (?,?,?,?)",
+            (
+                row.lastrowid,
+                service_id,
+                "source" if object_kind == "source_scope" else object_kind,
+                scope,
+            ),
+        )
 
-    def audit(self, actor: str, action: str, object_id: str, detail: str = "") -> None:
+    def audit(
+        self,
+        actor: str,
+        action: str,
+        object_id: str,
+        detail: str = "",
+        *,
+        service_id: str | None = None,
+        object_kind: str | None = None,
+    ) -> None:
         with self.db.connection() as db:
-            self._audit(db, actor, action, object_id, detail)
+            self._audit(
+                db, actor, action, object_id, detail, service_id=service_id, object_kind=object_kind
+            )
+
+    def bind_source_scope(self, source_id: str, service_id: str) -> None:
+        with self.db.connection() as db:
+            self._put(db, "source_scope", source_id, {"service_id": service_id})
+
+    def scoped_history(self) -> list[dict[str, Any]]:
+        with self.db.connection() as db:
+            return [
+                dict(row)
+                for row in db.execute(
+                    "SELECT a.*, s.service_id, s.object_kind, COALESCE(s.scope,'unknown') AS scope "
+                    "FROM audit a LEFT JOIN audit_scope s ON s.audit_id=a.id ORDER BY a.id DESC"
+                )
+            ]
+
+    def page_cursor(self, payload: dict[str, Any]) -> str:
+        body = canonical(payload).encode()
+        signature = hmac.new(self._key, b"service-page:" + body, hashlib.sha256).hexdigest()
+        return base64.urlsafe_b64encode(body).decode() + "." + signature
+
+    def read_page_cursor(self, cursor: str) -> dict[str, Any]:
+        try:
+            encoded, signature = cursor.split(".")
+            body = base64.b64decode(encoded, altchars=b"-_", validate=True)
+            expected = hmac.new(self._key, b"service-page:" + body, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(signature, expected):
+                raise ValueError("invalid signature")
+            value: dict[str, Any] = json.loads(body)
+            if not isinstance(value, dict):
+                raise ValueError("invalid cursor")
+            return value
+        except (ValueError, UnicodeError, TypeError) as exc:
+            raise ValueError("ページカーソルが無効です") from exc
 
     def audit_log(self, limit: int = 200) -> list[dict[str, Any]]:
         with self.db.connection() as db:
