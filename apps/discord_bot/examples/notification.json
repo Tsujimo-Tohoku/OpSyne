@@ -1,0 +1,12 @@
+{
+  "event_id": "demo-case-204-update-1",
+  "channel_id": "123456789012345678",
+  "case": {
+    "case_id": "DEMO-204",
+    "title": "デモ: 決済APIのエラー率上昇",
+    "state": "UNKNOWN",
+    "summary": "合成データです。操作結果は不明で、照合が必要です。",
+    "observed_at": "2026-09-15T14:32:00+09:00",
+    "evidence_refs": ["synthetic-evidence-1"]
+  }
+}

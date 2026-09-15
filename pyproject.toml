@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "opsyne"
+version = "0.1.0"
+description = "Local operations console with evidence, approval, and verified execution"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "openai>=2,<3",
+    "pydantic>=2.10,<3",
+    "uvicorn>=0.34,<1",
+]
+classifiers = ["Private :: Do Not Upload"]
+
+[project.scripts]
+opsyne = "opsyne.cli:main"
+
+[dependency-groups]
+dev = [
+  "hatchling>=1.27,<2",
+  "httpx2>=2,<3",
+  "import-linter>=2.3,<3",
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<10",
+  "ruff>=0.11,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/opsyne"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "pyproject.toml", "README.md"]
+
+[tool.uv]
+# Starlette 1.6 TestClient still references an alias deprecated in AnyIO 4.15.
+constraint-dependencies = ["anyio<4.15"]
+# uv.lock does not constrain an isolated editable build's dependencies.
+# Keep this build dependency closure aligned with uv.lock when updating Hatchling.
+build-constraint-dependencies = [
+  "hatchling==1.32.0",
+  "packaging==26.3",
+  "pathspec==1.1.1",
+  "pluggy==1.6.0",
+  "tomlkit==0.15.1",
+  "trove-classifiers==2026.6.1.19",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [".tools", ".uv-cache", ".local"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "scripts", "tests"]
+exclude = ["^\\.tools/", "^\\.venv/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-config --strict-markers --import-mode=importlib"
+filterwarnings = ["error"]
+markers = [
+  "integration: local component integration tests (no real service credentials)",
+]

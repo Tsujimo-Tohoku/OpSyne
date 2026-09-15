@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#111e31">
+    <title>OpSyne — Operations Console</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">メインコンテンツへ</a>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="メインナビゲーション">
+        <a href="#overview" class="brand" aria-label="OpSyne ホーム">
+          <span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span>OpSyne<span class="brand-caption">OPERATIONS INTELLIGENCE</span></span>
+        </a>
+        <div class="workspace-label"><span class="workspace-icon" aria-hidden="true">O</span><span>Operations workspace<small>Local environment</small></span></div>
+        <span class="nav-label">WORKSPACE</span>
+        <nav class="nav-list">
+          <a href="#overview" data-view="overview"><span class="nav-icon" aria-hidden="true">◫</span>概要<span class="nav-count" id="overview-count"></span></a>
+          <a href="#cases" data-view="cases"><span class="nav-icon" aria-hidden="true">▤</span>案件<span class="nav-count" id="case-count"></span></a>
+          <a href="#sources" data-view="sources"><span class="nav-icon" aria-hidden="true">◎</span>観測源</a>
+          <a href="#adapters" data-view="adapters"><span class="nav-icon" aria-hidden="true">⇄</span>変換定義</a>
+          <a href="#audit" data-view="audit"><span class="nav-icon" aria-hidden="true">≡</span>監査ログ</a>
+        </nav>
+        <div class="sidebar-note"><span class="eyebrow">CONTROL BY DESIGN</span><p>観測から対応、<br>独立した結果確認まで。</p><div class="mini-flow" aria-hidden="true"><i></i><b></b><i></i><b></b><i></i><b></b><i></i></div></div>
+        <div class="sidebar-footer"><span class="avatar" aria-hidden="true">OP</span><span id="identity">未接続<small>アクセストークンで接続</small></span><button class="icon-button light" id="session-button" type="button" aria-label="接続設定" title="接続設定">↗</button></div>
+      </aside>
+      <div class="workspace">
+        <header class="topbar"><div class="breadcrumb">Workspace <span>/</span> <strong id="breadcrumb-title">概要</strong></div><div class="topbar-right"><span class="connection-indicator" id="connection-state"><i></i>未接続</span><button type="button" class="text-button" id="refresh-button">↻ <span>更新</span></button></div></header>
+        <main id="main" tabindex="-1">
+          <div class="page-heading"><div><div class="eyebrow" id="page-eyebrow">OPERATIONS OVERVIEW</div><h1 id="page-title">運用の現在地</h1><p id="page-description">観測の状態と対応の進捗を、一つの場所で。</p></div><div class="heading-actions" id="heading-actions"></div></div>
+          <div class="message error" id="global-error" role="alert" hidden></div>
+          <div id="page-content"><div class="loading-card" role="status"><span class="spinner" aria-hidden="true"></span><p>ワークスペースに接続しています…</p></div></div>
+          <footer class="page-footer"><span>OpSyne <b>·</b> Operations Console</span><span id="last-updated">接続待ち</span></footer>
+        </main>
+      </div>
+    </div>
+    <dialog id="auth-dialog" class="auth-dialog" aria-labelledby="auth-title">
+      <div class="auth-brand"><span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i></span> OpSyne</div>
+      <div class="eyebrow">WELCOME TO YOUR WORKSPACE</div><h2 id="auth-title">運用を、見通せる状態に。</h2><p class="muted">設定したアクセストークンで接続してください。権限に応じたワークスペースを表示します。</p>
+      <form id="auth-form"><label for="auth-token">アクセストークン</label><input id="auth-token" name="token" type="password" required autocomplete="off" placeholder="設定ファイルのトークンを入力" spellcheck="false"><div id="auth-error" class="message error" role="alert" hidden></div><button class="button primary full-width" type="submit">ワークスペースに接続 <span aria-hidden="true">→</span></button></form>
+      <p class="auth-footnote">トークンはこのタブのセッションに保存されます。</p>
+    </dialog>
+    <dialog id="action-dialog" class="action-dialog" aria-labelledby="dialog-title"><div class="dialog-heading"><div><div class="eyebrow" id="dialog-eyebrow">WORKSPACE</div><h2 id="dialog-title"></h2></div><button class="icon-button" id="dialog-close" type="button" aria-label="閉じる">×</button></div><div id="dialog-content"></div></dialog>
+    <div id="toast" class="toast" role="status" hidden></div>
+    <noscript><div class="noscript">このコンソールには JavaScript が必要です。</div></noscript>
+  </body>
+</html>

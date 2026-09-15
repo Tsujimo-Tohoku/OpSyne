@@ -1,0 +1,872 @@
+"use strict";
+
+// API records are evidence, never markup. All server values use textContent.
+const $ = (selector) => document.querySelector(selector);
+const storeKey = "opsyne.access-token";
+const state = { token: "", session: null, data: null, view: "overview", refreshBusy: false, caseId: null, query: "", filter: "all", modalEpoch: 0, caseLive: null, renderedData: "" };
+try { state.token = sessionStorage.getItem(storeKey) || ""; } catch { /* In-memory sessions work when browser storage is unavailable. */ }
+const headings = {
+  overview: ["概要", "OPERATIONS OVERVIEW", "運用の現在地", "観測の状態と対応の進捗を、一つの場所で。"],
+  cases: ["案件", "CASE MANAGEMENT", "根拠から、次の判断へ。", "調査・提案・承認・実行・結果確認を案件ごとに追跡します。"],
+  sources: ["観測源", "OBSERVABILITY", "観測をつなぐ", "登録された対象と、収集の完全性を確認します。"],
+  adapters: ["変換定義", "NORMALIZATION", "原本に、意味を結び付ける。", "適用範囲と版を固定した変換定義を管理します。"],
+  audit: ["監査ログ", "AUDIT TRAIL", "判断と操作の記録", "誰が、何に、どのような操作を行ったかを確認します。"],
+};
+const statuses = {
+  OPEN: ["未着手", "blue"], INVESTIGATING: ["調査中", "blue"], ANALYZED: ["調査済み", "blue"],
+  PROPOSED: ["提案済み", "purple"], AWAITING_APPROVAL: ["承認待ち", "amber"], DRAFT: ["承認待ち", "amber"],
+  APPROVED: ["承認済み", "teal"], REJECTED: ["却下", "red"], REVOKED: ["失効", "red"], EXPIRED: ["期限切れ", "amber"],
+  EXECUTED: ["実行済み", "blue"], EXECUTING: ["実行中", "blue"], VERIFYING: ["結果確認待ち", "amber"], PENDING: ["待機中", "amber"], IN_FLIGHT: ["実行中", "blue"],
+  SUCCEEDED: ["操作成功", "blue"], FAILED: ["失敗", "red"], UNKNOWN: ["確認不能", "amber"],
+  RESOLVED: ["復旧確認済み", "teal"], CLOSED: ["終了", "teal"], VERIFIED: ["結果確認済み", "teal"],
+  PASS: ["条件充足を確認", "teal"], FAIL: ["条件未達", "red"], ACTIVE: ["有効", "teal"],
+  healthy: ["受信継続", "teal"], stale: ["受信遅延", "amber"], missing: ["未受信", "amber"], disabled: ["停止中", "outline"],
+  KNOWN: ["解析済み", "teal"], PARTIAL: ["部分解析", "amber"], INVALID: ["解析失敗", "red"],
+  RUNNING: ["進行中", "blue"], COMPLETED: ["完了", "teal"], DONE: ["完了", "teal"], BLOCKED: ["保留", "amber"],
+};
+const roleNames = { admin: "管理者", operator: "運用担当", approver: "承認者", viewer: "閲覧者", agent: "Agent" };
+const taskRoleNames = { operator: "運用調査", sre: "信頼性調査", security: "セキュリティ調査", adapter: "変換定義の提案", periodic: "定期調査" };
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  return node;
+}
+function append(parent, ...children) { for (const child of children.flat()) if (child) parent.append(child); return parent; }
+function button(text, handler, kind = "button", allowed = true) {
+  const node = el("button", kind, text);
+  node.type = "button";
+  node.disabled = !allowed;
+  if (!allowed) node.title = "現在の役割ではこの操作を行えません";
+  node.addEventListener("click", handler);
+  return node;
+}
+function badge(status) { const [label, color] = statuses[status] || [status || "未確認", "outline"]; return el("span", `badge ${color}`, label); }
+function severity(value) {
+  const levels = { CRITICAL: "緊急", ERROR: "高", HIGH: "高", WARNING: "中", MEDIUM: "中", LOW: "低", INFO: "情報", DEBUG: "詳細", UNKNOWN: "不明" };
+  const level = String(value || "UNKNOWN").toUpperCase();
+  return el("span", `severity ${level === "ERROR" ? "high" : level.toLowerCase()}`, levels[level] || level);
+}
+function message(text, type = "info") { return el("div", `message ${type}`, text); }
+function jsonDetails(title, value, open = false) {
+  const node = el("details"); node.open = open;
+  append(node, el("summary", "", title), el("pre", "", JSON.stringify(value, null, 2)));
+  return node;
+}
+function date(value, full = false) {
+  if (value === null || value === undefined || value === "") return "未記録";
+  const parsed = new Date(typeof value === "number" ? value * 1000 : value);
+  if (Number.isNaN(parsed.getTime())) return "日時不明";
+  return new Intl.DateTimeFormat("ja-JP", full
+    ? { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }
+    : { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(parsed);
+}
+function relative(value) {
+  if (value === null || value === undefined) return "未受信";
+  const milliseconds = typeof value === "number" ? value * 1000 : Date.parse(value);
+  if (!Number.isFinite(milliseconds)) return "日時不明";
+  const seconds = Math.max(0, Math.floor((Date.now() - milliseconds) / 1000));
+  if (seconds < 60) return "1分以内";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}分前`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}時間前`;
+  return `${Math.floor(seconds / 86400)}日前`;
+}
+function relativeNode(value, className = "") {
+  const node = el("span", className, relative(value));
+  if (value !== null && value !== undefined) node.dataset.relativeTimestamp = typeof value === "number" ? String(value) : String(Date.parse(value) / 1000);
+  return node;
+}
+function dataSignature() {
+  if (!state.data) return "";
+  const { worker, ...records } = state.data;
+  return JSON.stringify(records);
+}
+function rows(key) { return Array.isArray(state.data?.[key]) ? state.data[key] : []; }
+function serviceName(id) { return rows("services").find((item) => item.id === id)?.name || id || "対象未登録"; }
+function sourceName(id) { return rows("sources").find((item) => item.id === id)?.name || id || "観測源不明"; }
+function can(operation) {
+  const role = state.session?.role;
+  const rules = { configure: ["admin"], operate: ["admin", "operator"], approve: ["admin", "approver"] };
+  return (rules[operation] || []).includes(role);
+}
+function selfProposed(record) { return [record.proposer, record.proposed_by, record.created_by].includes(state.session?.actor); }
+function safeId(value) { return encodeURIComponent(String(value)); }
+function planObject(record) { return record.plan || record; }
+function adapterObject(record) { return record.definition || record; }
+function errorText(detail) {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) return detail.map((item) => `${(item.loc || []).filter((part) => part !== "body").join(".")}: ${item.msg || JSON.stringify(item)}`).join(" / ");
+  return detail ? JSON.stringify(detail) : "応答に詳細がありません。監査ログとサーバーの状態を確認してください。";
+}
+async function api(path, body, token = state.token) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 70000);
+  try {
+    const response = await fetch(`/api${path}`, {
+      method: body === undefined ? "GET" : "POST",
+      headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal: controller.signal, cache: "no-store", credentials: "same-origin",
+    });
+    let result;
+    try { result = await response.json(); } catch { result = null; }
+    if (!response.ok) {
+      if (response.status === 401 && state.session) disconnect("認証の有効性を確認できません。トークンを確認して再接続してください。");
+      throw new Error(`${response.status === 403 ? "この操作の権限がありません。" : ""}${errorText(result?.detail || result?.error || (response.status === 401 ? "トークンが正しいか確認してください。" : null))}`);
+    }
+    return result;
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("応答がタイムアウトしました。操作結果は不明です。状態を更新し、実行台帳を照合してください。");
+    if (error instanceof TypeError) throw new Error("サーバーに接続できません。起動状態を確認し、更新してください。操作済みの場合は結果を確認するまで再送しないでください。");
+    throw error;
+  } finally { clearTimeout(timeout); }
+}
+let toastTimer;
+function toast(text, error = false) {
+  clearTimeout(toastTimer);
+  $("#toast").textContent = text;
+  $("#toast").className = `toast${error ? " error" : ""}`;
+  $("#toast").hidden = false;
+  toastTimer = setTimeout(() => { $("#toast").hidden = true; }, error ? 10000 : 5500);
+}
+async function busy(node, action) {
+  if (node.disabled) return;
+  node.disabled = true; node.setAttribute("aria-busy", "true");
+  try { await action(); } catch (error) { toast(error.message, true); }
+  finally { node.disabled = false; node.removeAttribute("aria-busy"); node.dispatchEvent(new Event("opsyne:idle")); }
+}
+function setConnection(connected) {
+  const target = $("#connection-state");
+  target.className = `connection-indicator ${connected ? "connected" : "failed"}`;
+  target.replaceChildren(el("i"), document.createTextNode(connected ? "接続中 · 10秒ごとに更新" : "接続を確認してください"));
+}
+function disconnect(reason) {
+  state.token = ""; state.session = null; state.data = null;
+  try { sessionStorage.removeItem(storeKey); } catch { /* Session memory was cleared above. */ }
+  $("#identity").replaceChildren(document.createTextNode("未接続"), el("small", "", "アクセストークンで接続"));
+  $("#page-content").replaceChildren(empty("接続が必要です", "アクセストークンでワークスペースに接続してください。", "◎"));
+  $("#heading-actions").replaceChildren();
+  $("#case-count").textContent = "";
+  $("#global-error").hidden = true;
+  $("#action-dialog").close();
+  state.modalEpoch += 1;
+  $("#auth-error").textContent = reason || ""; $("#auth-error").hidden = !reason;
+  if (!$("#auth-dialog").open) $("#auth-dialog").showModal();
+  $("#auth-token").focus();
+  setConnection(false);
+}
+async function connect(token) {
+  const session = await api("/session", undefined, token);
+  if (!session?.actor || !Object.hasOwn(roleNames, session.role)) throw new Error("サーバーから有効な認証情報を取得できませんでした。");
+  state.token = token; state.session = session;
+  try { sessionStorage.setItem(storeKey, token); } catch { /* Continue with an in-memory token. */ }
+  $("#identity").replaceChildren(document.createTextNode(session.actor), el("small", "", roleNames[session.role] || session.role));
+  $("#auth-dialog").close(); $("#auth-token").value = "";
+  await refresh(true);
+}
+async function refresh(force = false) {
+  if (!state.session || state.refreshBusy) return;
+  state.refreshBusy = true;
+  try {
+    const overview = await api("/overview");
+    if (!overview || ["services", "sources", "cases", "plans", "executions", "adapters", "audit", "coverage", "tasks"].some((key) => !Array.isArray(overview[key]))) throw new Error("状態データの形式を確認できません。未確認のデータを正常として表示しないため、最後に取得できた状態を保持しています。");
+    state.data = overview;
+    $("#global-error").hidden = true;
+    setConnection(true);
+    $("#last-updated").textContent = `最終取得 ${date(Date.now() / 1000, true)}`;
+    $("#case-count").textContent = rows("cases").filter((item) => !["RESOLVED", "CLOSED"].includes(item.status)).length || "";
+    const focused = document.activeElement;
+    const editing = focused && ["INPUT", "TEXTAREA", "SELECT", "BUTTON", "SUMMARY", "A"].includes(focused.tagName) && $("#page-content").contains(focused);
+    if (force || (!editing && !$("#action-dialog").open && dataSignature() !== state.renderedData)) render();
+    document.querySelectorAll("[data-relative-timestamp]").forEach((node) => { node.textContent = relative(Number(node.dataset.relativeTimestamp)); });
+    if (state.caseLive && $("#action-dialog").open) await refreshCaseSignals();
+  } catch (error) {
+    setConnection(false);
+    $("#global-error").textContent = error.message;
+    $("#global-error").hidden = false;
+    if (!state.data && state.session) $("#page-content").replaceChildren(empty("データを取得できませんでした", "サーバーの状態を確認し、右上の「更新」を押してください。", "↻"));
+  } finally { state.refreshBusy = false; }
+}
+function navigate() {
+  const requested = location.hash.slice(1) || "overview";
+  state.view = headings[requested] ? requested : "overview";
+  state.query = ""; state.filter = "all";
+  if (state.data) render();
+  updateHeadings();
+}
+function updateHeadings() {
+  const [breadcrumb, eyebrow, title, description] = headings[state.view];
+  $("#breadcrumb-title").textContent = breadcrumb;
+  $("#page-eyebrow").textContent = eyebrow; $("#page-title").textContent = title; $("#page-description").textContent = description;
+  document.title = `${breadcrumb} — OpSyne`;
+  document.querySelectorAll("[data-view]").forEach((link) => {
+    const active = link.dataset.view === state.view;
+    link.classList.toggle("active", active);
+    if (active) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current");
+  });
+}
+function render() {
+  state.renderedData = dataSignature();
+  updateHeadings();
+  const actions = $("#heading-actions"); actions.replaceChildren();
+  if (state.view === "overview" || state.view === "sources") {
+    append(actions, button("↻  収集・解析", (event) => busy(event.currentTarget, async () => {
+      const result = await api("/poll", {}); toast("収集・解析の処理が完了しました。"); await refresh(true);
+      if (result?.errors?.length) toast(errorText(result.errors), true);
+    }), "button", can("operate")), button("＋ 観測源を登録", sourceForm, "button primary", can("configure")));
+  }
+  if (state.view === "adapters") append(actions, button("＋ 変換定義を作成", adapterForm, "button primary", can("configure") || can("operate")));
+  if (state.view === "cases") append(actions, button("↻  最新の状態を取得", () => refresh(true)));
+  const views = { overview: renderOverview, cases: renderCases, sources: renderSources, adapters: renderAdapters, audit: renderAudit };
+  $("#page-content").replaceChildren(views[state.view]());
+}
+function empty(title, description, symbol = "◫", action = null) {
+  return append(el("div", "empty-state"), el("span", "empty-icon", symbol), el("h3", "", title), el("p", "", description), action);
+}
+function panel(title, subtitle = "", count = null, action = null) {
+  const root = el("section", "panel");
+  const heading = el("div", "panel-heading", title);
+  if (count !== null) heading.append(el("span", "count", count));
+  const headingWrap = append(el("div"), heading, subtitle ? el("p", "panel-subtitle", subtitle) : null);
+  root.append(append(el("div", "panel-header"), headingWrap, action));
+  return root;
+}
+function info(items) {
+  const grid = el("dl", "info-grid");
+  for (const [key, value] of items) append(grid, append(el("div", "info-item"), el("dt", "", key), value instanceof Node ? append(el("dd"), value) : el("dd", "", value ?? "未設定")));
+  return grid;
+}
+function metrics() {
+  const active = rows("cases").filter((item) => !["RESOLVED", "CLOSED"].includes(item.status));
+  const pending = rows("plans").filter((item) => item.status === "DRAFT");
+  const uncertain = rows("sources").filter((source) => !["healthy", "disabled"].includes(rows("coverage").find((item) => item.source_id === source.id)?.status));
+  const unknown = rows("executions").filter((item) => item.status === "UNKNOWN");
+  const cards = [
+    ["進行中の案件", active.length, "▤", "調査から結果確認まで", ""],
+    ["承認待ちの計画", pending.length, "◇", "固定された計画への判断が必要", "warn"],
+    ["観測状態の要確認", uncertain.length, "◎", `${rows("sources").length} 観測源を登録済み`, "warn"],
+    ["操作結果不明", unknown.length, "⇄", "照合が完了するまで再送を保留", "danger"],
+  ];
+  const grid = el("div", "metrics-grid");
+  for (const [label, value, icon, description, color] of cards) {
+    append(grid, append(el("div", "metric-card"), append(el("div", "metric-top"), el("span", "", label), el("span", "metric-icon", icon)), el("div", `metric-number ${value ? color : ""}`, value), el("div", "metric-description", description)));
+  }
+  return grid;
+}
+function caseTable(cases) {
+  if (!cases.length) return empty("該当する案件はありません", "観測データから検知された候補がここに表示されます。案件がないことは、対象の正常性を保証しません。", "▤");
+  const table = el("table", "case-table data-table");
+  const head = el("tr");
+  for (const [label, className] of [["案件 / 対象", ""], ["重要度", ""], ["状態", ""], ["更新", "hide-compact"], ["", ""]]) {
+    const th = el("th", className, label); th.scope = "col"; head.append(th);
+  }
+  table.append(append(el("thead"), head));
+  const body = el("tbody");
+  for (const item of cases) {
+    const title = button(item.title || item.id, () => openCase(item.id), "case-title");
+    const meta = append(el("div", "case-meta"), el("span", "", serviceName(item.service_id)), el("span", "", "·"), el("span", "", item.kind || "案件"));
+    const link = button("詳細 →", () => openCase(item.id), "inline-link"); link.setAttribute("aria-label", `${item.title || item.id} の詳細`);
+    append(body, append(el("tr"), append(el("td"), title, meta), append(el("td"), severity(item.severity)), append(el("td"), badge(item.status)), append(el("td", "hide-compact muted"), relativeNode(item.updated_at || item.created_at)), append(el("td"), link)));
+  }
+  table.append(body); return append(el("div", "table-scroll"), table);
+}
+function renderCoverage() {
+  const root = panel("観測の完全性", "対象の正常性とは独立して評価", null, button("観測源へ →", () => { location.hash = "sources"; }, "inline-link"));
+  const body = el("div", "panel-body");
+  const healthy = rows("coverage").filter((item) => item.status === "healthy").length;
+  const count = rows("sources").length;
+  const summary = append(el("div", "coverage-summary"), el("span", "ring", "◎"), append(el("div"), el("strong", "", count ? `${healthy} / ${count} 観測源が受信継続` : "観測源は未登録です"), el("p", "", "最終受信・解析失敗・欠落を個別に確認")));
+  body.append(summary);
+  for (const source of rows("sources").slice(0, 4)) {
+    const coverage = rows("coverage").find((item) => item.source_id === source.id);
+    const row = el("div", "coverage-row");
+    append(row, append(el("div", "coverage-row-head"), el("span", "coverage-row-name", source.name), badge(coverage?.status || "missing")), append(el("div", "coverage-row-meta"), el("span", "", source.kind === "file" ? "FILE COLLECTOR" : "PUSH INGESTION"), relativeNode(coverage?.last_received)));
+    body.append(row);
+  }
+  append(root, body, el("div", "section-note", "未受信や解析不能のデータを正常として扱いません。"));
+  return root;
+}
+function renderOverview() {
+  const root = el("div");
+  const recovery = state.data?.recovery;
+  if (can("configure") && (recovery?.quarantined || recovery?.holds?.length)) {
+    const notice = panel("復元・実行保留の確認", recovery.quarantined ? "復元後の照合が完了するまで、新しい実行許可を保留しています" : "記録された実行予約と台帳の状態を確認できます", null, button("管理者として確認", recoveryDetails, "button small"));
+    notice.append(el("div", "section-note", `復元後の確認待ち: ${recovery.quarantined ? "あり" : "なし"} · 実行予約: ${recovery.holds?.length || 0} 件`)); root.append(notice);
+  }
+  root.append(metrics());
+  const primary = el("div", "overview-primary");
+  const recent = [...rows("cases")].sort((a, b) => (b.updated_at || b.created_at) - (a.updated_at || a.created_at)).slice(0, 6);
+  const cases = panel("対応する案件", "根拠を確認し、次のアクションへ", rows("cases").length, button("すべて見る →", () => { location.hash = "cases"; }, "inline-link"));
+  cases.append(caseTable(recent)); primary.append(cases);
+  const activity = panel("最近のアクティビティ", "判断と操作は監査ログに記録されます", null, button("監査ログへ →", () => { location.hash = "audit"; }, "inline-link"));
+  activity.append(activityList(rows("audit").slice(0, 4))); primary.append(activity);
+  const secondary = el("div", "overview-secondary"); secondary.append(renderCoverage());
+  const workflow = el("section", "workflow-card");
+  append(workflow, el("div", "eyebrow", "HUMAN GOVERNED OPERATIONS"), el("h3", "", "判断の根拠を、最後まで。"), el("p", "", "提案と認可、操作と結果確認を分離。承認した計画を現在の条件で照合し、実行後の状態を独立して確かめます。"));
+  const steps = el("div", "workflow-steps");
+  ["観測", "調査", "承認", "実行", "確認"].forEach((label, index) => { if (index) steps.append(el("b", "", "→")); steps.append(el("span", "", label)); });
+    workflow.append(steps); secondary.append(workflow);
+  const llm = state.data?.llm;
+  if (llm) {
+    const llmPanel = panel("調査モデル", "収集処理はモデルの稼働に依存しません");
+    const llmBody = el("div", "panel-body");
+    append(llmBody, info([["モデル", llm.model || "未設定"], ["日次呼び出し上限", llm.daily_call_limit ?? "未設定"]]), llm.configured ? badge("ACTIVE") : el("span", "badge outline", "未設定"));
+    if (!llm.configured) llmBody.append(el("p", "field-hint", "API キーが未設定です。サーバー環境に OPENAI_API_KEY を設定して調査を有効にしてください。"));
+    llmPanel.append(llmBody); secondary.append(llmPanel);
+  }
+  if (!rows("services").length) {
+    const start = panel("はじめの一歩", "対象を登録して、観測を開始");
+    const body = el("div", "panel-body");
+    append(body, button("＋ サービスを登録", serviceForm, "button full-width", can("configure")), button("合成データで動作を確認", demoForm, "button subtle full-width", can("configure")), el("p", "field-hint", "デモは明示的に追加する合成データです。"));
+    start.append(body); secondary.append(start);
+  }
+  root.append(append(el("div", "overview-grid"), primary, secondary)); return root;
+}
+function toolbar(placeholder, filters, onChange) {
+  const bar = el("div", "toolbar");
+  const search = el("input", "search-input"); search.type = "search"; search.placeholder = placeholder; search.value = state.query; search.setAttribute("aria-label", placeholder);
+  search.addEventListener("input", () => { state.query = search.value; onChange(); });
+  bar.append(search);
+  if (filters) {
+    const select = el("select", "filter-select"); select.setAttribute("aria-label", "状態で絞り込み");
+    filters.forEach(([value, text]) => { const option = el("option", "", text); option.value = value; select.append(option); });
+    select.value = state.filter; select.addEventListener("change", () => { state.filter = select.value; onChange(); }); bar.append(select);
+  }
+  return bar;
+}
+function renderCases() {
+  const root = el("div"); const target = el("div");
+  const update = () => {
+    const query = state.query.toLocaleLowerCase();
+    const matches = rows("cases").filter((item) => `${item.title} ${item.id} ${serviceName(item.service_id)}`.toLocaleLowerCase().includes(query) && (state.filter === "all" || (state.filter === "open" ? !["RESOLVED", "CLOSED"].includes(item.status) : ["RESOLVED", "CLOSED"].includes(item.status))));
+    const list = panel("案件一覧", "原本・調査結果・固定計画・実行台帳を確認", matches.length); list.append(caseTable(matches)); target.replaceChildren(list);
+  };
+  append(root, toolbar("案件名・サービス・IDで検索", [["all", "すべての状態"], ["open", "進行中"], ["resolved", "解決・終了"]], update), target); update(); return root;
+}
+function renderSources() {
+  const root = el("div");
+  const heading = append(el("div", "list-section-heading"), el("h2", "", `サービス (${rows("services").length})`), button("＋ サービスを登録", serviceForm, "button small", can("configure")));
+  root.append(heading);
+  if (!rows("services").length) root.append(append(el("div", "panel"), empty("サービスを登録してください", "監視対象の実体・版・所有者を先に登録します。その後、観測源を関連付けます。", "◎")));
+  else {
+    const grid = el("div", "source-grid");
+    for (const service of rows("services")) {
+      const card = el("article", "source-card");
+      append(card, append(el("div", "source-card-head"), el("div", "source-icon", "▧"), append(el("div"), el("h3", "", service.name), el("p", "", service.id)), badge(service.enabled ? "ACTIVE" : "disabled")), info([["対象実体", service.instance_id], ["対象版", `v${service.version}`], ["所有者", service.owner], ["重要度", service.criticality]]), append(el("div", "card-actions"), button("操作能力・独立確認の設定", () => integrationDetails(service), "button small")));
+      grid.append(card);
+    }
+    root.append(grid);
+  }
+  root.append(append(el("div", "list-section-heading"), el("h2", "", `観測源 (${rows("sources").length})`)));
+  if (!rows("sources").length) root.append(append(el("div", "panel"), empty("まだ観測源がありません", "ログファイルまたは Push 取込の観測源を登録してください。", "◎")));
+  else {
+    const grid = el("div", "source-grid");
+    for (const source of rows("sources")) {
+      const coverage = rows("coverage").find((item) => item.source_id === source.id);
+      const card = el("article", "source-card");
+      append(card, append(el("div", "source-card-head"), el("div", "source-icon", source.kind === "file" ? "▤" : "⇣"), append(el("div"), el("h3", "", source.name), el("p", "", serviceName(source.service_id))), badge(coverage?.status || "missing")), info([["取込方式", source.kind === "file" ? "ログファイル" : "Push / API"], ["最終受信", relativeNode(coverage?.last_received)], ["解析失敗", coverage?.parse_failures ?? "未確認"], ["未知形式", coverage?.unknown_count ?? "未確認"], ["未処理", coverage?.pending_count ?? "未確認"], ["欠落", coverage?.gap_count ?? "未確認"]]));
+      if (coverage?.last_error) card.append(message(coverage.last_error, "warning"));
+      const actions = el("div", "card-actions");
+      if (source.kind === "push") actions.append(button("イベントを取り込む", () => ingestForm(source), "button small", can("operate")));
+      actions.append(button("観測詳細", () => {
+        const body = openDialog(source.name, "OBSERVATION DETAILS");
+        append(body, jsonDetails("観測源の設定", source, true), jsonDetails("収集の完全性", coverage || { status: "missing" }, true));
+      }, "button small"));
+      card.append(actions); grid.append(card);
+    }
+    root.append(grid);
+  }
+  const demo = append(el("div", "panel"), append(el("div", "panel-header"), append(el("div"), el("h3", "", "合成データで確認"), el("p", "panel-subtitle", "隔離されたデモ対象と観測イベントを追加します。")), button("デモを準備", demoForm, "button small", can("configure"))));
+  root.append(demo); return root;
+}
+function renderAdapters() {
+  const root = el("div");
+  root.append(message("変換定義は原本の解釈に使います。定義の承認・再解析から、対象の操作が実行されることはありません。"));
+  if (!rows("adapters").length) root.append(append(el("div", "panel"), empty("変換定義は未登録です", "JSON の項目対応と値の意味を定義します。適用範囲と版を確認し、承認すると有効になります。", "⇄")));
+  const grid = el("div", "source-grid");
+  for (const record of rows("adapters")) {
+    const definition = adapterObject(record);
+    const card = el("article", "source-card");
+    append(card, append(el("div", "source-card-head"), el("div", "source-icon", "⇄"), append(el("div"), el("h3", "", definition.name), el("p", "", definition.id)), badge(record.status || (record.active ? "ACTIVE" : "DRAFT"))), info([["定義版", `v${definition.version}`], ["観測源", sourceName(definition.source_id)], ["対象実体", definition.target_instance_id], ["対象版", `v${definition.target_version}`]]));
+    card.append(append(el("div", "card-actions"), button("定義を確認", () => openAdapter(record), "button small"))); grid.append(card);
+  }
+  root.append(grid); return root;
+}
+function auditAction(entry) { return entry.action || entry.kind || entry.event || "操作記録"; }
+function activityList(entries) {
+  if (!entries.length) return empty("まだアクティビティはありません", "登録・承認・実行などの操作履歴をここに表示します。", "≡");
+  const list = el("div", "activity-list");
+  for (const entry of entries) append(list, append(el("div", "activity-item"), el("span", "activity-dot", "↗"), append(el("div", "activity-text"), el("div", "", auditAction(entry)), el("div", "activity-meta", `${entry.actor || "system"} · ${entry.target_id || entry.object_id || entry.resource_id || "workspace"}`)), relativeNode(entry.created_at || entry.at || entry.timestamp, "activity-time")));
+  return list;
+}
+function renderAudit() {
+  const root = el("div"); const target = el("div");
+  const update = () => {
+    const query = state.query.toLocaleLowerCase();
+    const entries = rows("audit").filter((item) => JSON.stringify(item).toLocaleLowerCase().includes(query));
+    const box = panel("監査ログ", "時刻はブラウザーのタイムゾーンで表示", entries.length);
+    if (!entries.length) box.append(empty("該当する記録はありません", "登録・調査・承認・実行の履歴がここに表示されます。", "≡"));
+    else {
+      const table = el("table", "data-table"); const head = el("tr");
+      ["日時", "実行主体", "操作", "対象", "詳細"].forEach((name) => { const th = el("th", "", name); th.scope = "col"; head.append(th); });
+      table.append(append(el("thead"), head)); const body = el("tbody");
+      for (const entry of entries) append(body, append(el("tr"), el("td", "muted", date(entry.created_at || entry.at || entry.timestamp)), el("td", "", entry.actor || "system"), el("td", "", auditAction(entry)), el("td", "audit-object", entry.target_id || entry.object_id || entry.resource_id || "—"), append(el("td"), button("詳細", () => {
+        const content = openDialog("監査記録", "AUDIT RECORD"); content.append(jsonDetails("記録された内容", entry, true));
+      }, "inline-link"))));
+      table.append(body); box.append(append(el("div", "table-scroll"), table));
+    }
+    target.replaceChildren(box);
+  };
+  append(root, toolbar("主体・操作・対象で検索", null, update), target); update();
+  if (rows("tasks").length) {
+    const tasks = panel("調査タスク", "有限の処理単位として保持された調査の記録", rows("tasks").length);
+    const body = el("div", "panel-body");
+    for (const task of rows("tasks").slice(0, 20)) body.append(jsonDetails(`${taskRoleNames[task.role] || task.role} · ${task.id} · ${task.status || "未確認"}`, task));
+    tasks.append(body); root.append(tasks);
+  }
+  return root;
+}
+function openDialog(title, eyebrow = "WORKSPACE", wide = false) {
+  state.modalEpoch += 1;
+  state.caseLive = null;
+  const dialog = $("#action-dialog"); dialog.classList.toggle("wide", wide);
+  $("#dialog-title").textContent = title; $("#dialog-eyebrow").textContent = eyebrow;
+  const content = $("#dialog-content"); content.replaceChildren();
+  if (!dialog.open) dialog.showModal();
+  return content;
+}
+function formField(form, label, name, { value = "", type = "text", options = null, hint = "", full = false, required = true, min = null, max = null, pattern = null } = {}) {
+  const wrapper = el("div", `form-field${full ? " full" : ""}`);
+  const id = `field-${name}`; const labelNode = el("label", "", label); labelNode.htmlFor = id;
+  let input;
+  if (options) {
+    input = el("select"); for (const [optionValue, optionText] of options) { const option = el("option", "", optionText); option.value = optionValue; input.append(option); }
+  } else input = el(type === "textarea" ? "textarea" : "input");
+  if (input.tagName === "INPUT") input.type = type;
+  input.id = id; input.name = name;
+  if (value !== "" || !options) input.value = value;
+  input.required = required;
+  if (min !== null) input.min = min;
+  if (max !== null) input.max = max;
+  if (pattern) input.pattern = pattern;
+  append(wrapper, labelNode, input);
+  if (hint) { const help = el("p", "field-hint", hint); help.id = `${id}-hint`; input.setAttribute("aria-describedby", help.id); wrapper.append(help); }
+  form.append(wrapper); return input;
+}
+function createForm(body, submitText, handler) {
+  const form = el("form"); const fields = el("div", "form-grid"); const error = message("", "error"); error.hidden = true; error.classList.add("form-error"); error.setAttribute("role", "alert");
+  const submit = el("button", "button primary", submitText); submit.type = "submit";
+  const actions = append(el("div", "form-actions"), button("キャンセル", () => $("#action-dialog").close()), submit);
+  append(form, fields, error, actions); body.append(form);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault(); if (submit.disabled) return; submit.disabled = true; submit.setAttribute("aria-busy", "true"); error.hidden = true;
+    try { await handler(new FormData(form)); }
+    catch (failure) { error.textContent = failure.message; error.hidden = false; }
+    finally { submit.disabled = false; submit.removeAttribute("aria-busy"); submit.dispatchEvent(new Event("opsyne:idle")); }
+  });
+  return { fields, form, submit };
+}
+function identifierOptions() { return { pattern: "[A-Za-z0-9_.:\\-]+", hint: "英数字・_・.・:・- を使用できます。" }; }
+function serviceForm() {
+  const body = openDialog("サービスを登録", "REGISTER SERVICE");
+  const { fields } = createForm(body, "サービスを登録", async (form) => {
+    const payload = Object.fromEntries(form); payload.version = Number(payload.version); payload.enabled = true;
+    await api("/services", payload); $("#action-dialog").close(); toast("サービスを登録しました。"); await refresh(true);
+  });
+  formField(fields, "サービス ID", "id", identifierOptions()); formField(fields, "サービス名", "name");
+  formField(fields, "対象実体 ID", "instance_id", identifierOptions()); formField(fields, "所有者", "owner", { value: state.session.actor });
+  formField(fields, "対象版", "version", { type: "number", min: 1, value: 1 });
+  formField(fields, "重要度", "criticality", { options: [["low", "低"], ["medium", "中"], ["high", "高"], ["critical", "緊急"]], value: "medium" });
+}
+function sourceForm() {
+  if (!rows("services").length) { serviceForm(); toast("先に観測対象のサービスを登録してください。"); return; }
+  const body = openDialog("観測源を登録", "REGISTER OBSERVATION SOURCE");
+  const { fields } = createForm(body, "観測源を登録", async (form) => {
+    const payload = Object.fromEntries(form); payload.stale_after_seconds = Number(payload.stale_after_seconds); payload.enabled = true;
+    if (payload.kind === "push") delete payload.path;
+    await api("/sources", payload); $("#action-dialog").close(); toast("観測源を登録しました。"); await refresh(true);
+  });
+  formField(fields, "観測源 ID", "id", identifierOptions()); formField(fields, "観測源名", "name");
+  formField(fields, "対象サービス", "service_id", { options: rows("services").map((item) => [item.id, item.name]) });
+  const kind = formField(fields, "取込方式", "kind", { options: [["push", "Push / API"], ["file", "ログファイル"]], value: "push" });
+  const path = formField(fields, "ログファイルの絶対パス", "path", { full: true, required: false, hint: "サーバーで許可したログディレクトリ内のファイルを指定します。" }); path.parentElement.hidden = true;
+  kind.addEventListener("change", () => { path.parentElement.hidden = kind.value !== "file"; path.required = kind.value === "file"; });
+  formField(fields, "受信遅延と判定する秒数", "stale_after_seconds", { value: 300, type: "number", min: 1, max: 604800, full: true });
+}
+function ingestForm(source) {
+  const body = openDialog("イベントを取り込む", source.name);
+  body.append(message("実際の原本を入力してください。外部イベント ID は同じイベントの再送で固定し、異なるイベントには別の ID を付けます。"));
+  const { fields } = createForm(body, "受領・解析する", async (form) => {
+    const result = await api(`/sources/${safeId(source.id)}/ingest`, { events: [{ external_id: form.get("external_id"), payload: form.get("payload") }] });
+    $("#action-dialog").close(); toast("イベントの取込を受け付けました。"); await refresh(true);
+    if (result?.errors?.length) toast(errorText(result.errors), true);
+  });
+  formField(fields, "外部イベント ID", "external_id", { full: true });
+  formField(fields, "原本（JSON またはログ本文）", "payload", { type: "textarea", full: true, hint: "この本文はデータとして保存されます。本文に含まれる命令が操作を認可することはありません。" });
+}
+function demoForm() {
+  const body = openDialog("合成データで動作を確認", "SYNTHETIC DEMO");
+  append(body, message("隔離されたデモサービス、観測イベント、変換定義と操作能力を準備します。対象はすべて合成データです。実サービスへの接続は行いません。"), el("p", "analysis-text", "案件から調査・計画作成へ進み、別の主体で承認後に実行と独立確認を試せます。"));
+  createForm(body, "合成データを追加", async () => {
+    await api("/demo", {}); $("#action-dialog").close(); toast("合成データのデモを準備しました。"); await refresh(true);
+  });
+}
+async function integrationDetails(service) {
+  const body = openDialog(`${service.name} の接続設定`, "SERVICE CAPABILITIES");
+  const epoch = state.modalEpoch;
+  append(body, message("実行する HTTP 操作と、独立した読取確認を別々に登録します。対象と操作は設定に固定され、計画の承認・認可を経て実行されます。"));
+  try {
+    const [capabilityResponse, checkResponse] = await Promise.all([api("/capabilities"), api("/checks")]);
+    if (state.modalEpoch !== epoch) return;
+    const capabilities = (Array.isArray(capabilityResponse) ? capabilityResponse : capabilityResponse.capabilities || []).filter((item) => item.service_id === service.id);
+    const check = Array.isArray(checkResponse) ? checkResponse.find((item) => item.service_id === service.id) : (checkResponse[service.id] || checkResponse.checks?.[service.id]);
+    const capabilitySection = section("登録された操作能力");
+    if (!capabilities.length) capabilitySection.append(el("p", "analysis-text", "登録された操作能力はありません。"));
+    for (const capability of capabilities) capabilitySection.append(jsonDetails(`${capability.name} · v${capability.version}`, capability));
+    capabilitySection.append(append(el("div", "card-actions"), button("操作能力を登録", () => capabilityForm(service), "button", can("configure"))));
+    const checkSection = section("独立した結果確認");
+    if (check) checkSection.append(jsonDetails("登録された読取確認", check, true));
+    else checkSection.append(el("p", "analysis-text", "独立確認は未設定です。未設定・確認不能は復旧と判断されません。"));
+    checkSection.append(append(el("div", "card-actions"), button("独立確認を設定", () => checkForm(service, check), "button", can("configure"))));
+    append(body, capabilitySection, checkSection);
+  } catch (error) { if (state.modalEpoch === epoch) body.append(message(error.message, "error")); }
+}
+function capabilityForm(service) {
+  const body = openDialog("HTTP 操作能力を登録", service.name);
+  body.append(message("登録された URL・HTTP メソッド・本文を持つ操作を作成します。認証が必要な場合はサーバーの環境変数名を指定します。秘密の値を本文に書かないでください。"));
+  const { fields } = createForm(body, "操作能力を登録", async (form) => {
+    const payload = Object.fromEntries(form);
+    payload.service_id = service.id; payload.kind = "http.request"; payload.version = Number(payload.version);
+    if (!payload.auth_env) delete payload.auth_env;
+    try { payload.body = JSON.parse(payload.body); } catch { throw new Error("HTTP 本文には有効な JSON オブジェクトを入力してください。"); }
+    if (!payload.body || typeof payload.body !== "object" || Array.isArray(payload.body)) throw new Error("HTTP 本文は JSON オブジェクトで指定してください。");
+    await api("/capabilities", payload); toast("HTTP 操作能力を登録しました。"); await refresh(); await integrationDetails(service);
+  });
+  formField(fields, "操作能力 ID", "id", identifierOptions()); formField(fields, "表示名", "name");
+  formField(fields, "操作先 URL", "endpoint", { type: "url", full: true });
+  formField(fields, "HTTP メソッド", "method", { options: [["POST", "POST"], ["PUT", "PUT"], ["PATCH", "PATCH"], ["DELETE", "DELETE"]], value: "POST" });
+  formField(fields, "操作能力の版", "version", { type: "number", min: 1, value: 1 });
+  formField(fields, "認証トークンの環境変数名", "auth_env", { full: true, required: false, pattern: "[A-Za-z_][A-Za-z0-9_]*", hint: "例: SERVICE_OPERATION_TOKEN。トークンの値は入力しません。" });
+  const bodyInput = formField(fields, "固定された HTTP 本文（JSON オブジェクト）", "body", { type: "textarea", value: "{}", full: true }); bodyInput.spellcheck = false;
+}
+function checkForm(service, existing) {
+  const configured = existing?.check || existing?.config || existing;
+  const body = openDialog("独立した結果確認を設定", service.name);
+  body.append(message("GET リクエストで実行後の実状態を観測します。操作 API の成功応答から独立した URL と条件を設定してください。"));
+  const { fields } = createForm(body, "独立確認を保存", async (form) => {
+    const payload = Object.fromEntries(form); payload.kind = "http"; payload.expected_status = Number(payload.expected_status);
+    if (!payload.auth_env) delete payload.auth_env;
+    if (!payload.body_contains) delete payload.body_contains;
+    await api(`/services/${safeId(service.id)}/check`, payload); toast("独立した結果確認を設定しました。"); await refresh(); await integrationDetails(service);
+  });
+  formField(fields, "読取確認の URL", "endpoint", { type: "url", value: configured?.endpoint || "", full: true });
+  formField(fields, "期待する HTTP ステータス", "expected_status", { type: "number", min: 100, max: 599, value: configured?.expected_status || 200, full: true });
+  formField(fields, "応答本文に必要な文字列", "body_contains", { value: configured?.body_contains || "", required: false, full: true, hint: "未指定の場合、HTTP ステータスだけを確認します。業務条件を判定できる内容を指定してください。" });
+  formField(fields, "読取認証トークンの環境変数名", "auth_env", { value: configured?.auth_env || "", required: false, full: true, pattern: "[A-Za-z_][A-Za-z0-9_]*", hint: "操作用の認証情報とは分離した読取専用の資格情報を使用します。" });
+}
+async function recoveryDetails() {
+  const body = openDialog("復元・実行保留の確認", "RECOVERY REVIEW", true);
+  const epoch = state.modalEpoch;
+  body.append(message("対象サービス側の操作履歴と、保存された台帳を照合してください。通常の正常性チェックだけでは、未送信やバックアップの整合性を確認できません。", "warning"));
+  try {
+    const overview = await api("/overview");
+    if (state.modalEpoch !== epoch) return;
+    const recovery = overview.recovery;
+    if (!recovery || !can("configure")) throw new Error("管理者用の復元状態を取得できません。");
+    const quarantine = section("復元後の実行制限");
+    if (recovery.quarantined) {
+      append(quarantine, message("バックアップ後に対象側で行われた操作を照合するまで、新しい実行許可は発行されません。照合完了を記録しても、古い承認が再び有効になることはありません。", "warning"), button("復元前後の照合結果を記録", () => recoveryForm(null), "button"));
+    } else quarantine.append(el("p", "analysis-text", "復元後の照合による実行制限は記録されていません。"));
+    body.append(quarantine);
+    const holds = section(`実行予約 (${recovery.holds?.length || 0})`);
+    if (!recovery.holds?.length) holds.append(el("p", "analysis-text", "保留中の実行予約はありません。"));
+    for (const hold of recovery.holds || []) {
+      const card = el("article", "plan-card");
+      append(card, info([["対象サービス", serviceName(hold.service_id)], ["計画", hold.plan_id], ["許可", hold.permit_id], ["実行台帳", hold.has_execution ? "記録あり" : "記録なし"]]));
+      if (hold.has_execution) {
+        card.append(message("実行台帳に記録がある予約はここで解除できません。案件の実行台帳から操作結果を照合してください。"));
+        const plan = rows("plans").find((item) => planObject(item).id === hold.plan_id);
+        if (plan) card.append(button("案件の実行台帳を開く", () => openCase(planObject(plan).case_id), "button small"));
+      } else card.append(append(el("div", "card-actions"), button("未送信の照合結果を記録", () => recoveryForm(hold), "button small")));
+      holds.append(card);
+    }
+    body.append(holds);
+  } catch (error) { if (state.modalEpoch === epoch) body.append(message(error.message, "error")); }
+}
+function recoveryForm(hold) {
+  const body = openDialog(hold ? "未送信の実行予約を解消" : "復元前後の照合完了を記録", "ADMINISTRATOR RECOVERY REVIEW");
+  body.append(message(hold
+    ? "対象サービスの履歴を確認し、この計画の操作が送信されていない根拠を記録します。操作済み・結果不明・照合不能の場合は解除しないでください。解除した計画は却下され、新しい計画と承認が必要です。"
+    : "バックアップ以降の対象側の操作履歴、原本・承認・実行台帳の整合性を確認し、根拠を記録してください。確認不能な範囲が残る場合は実行制限を維持してください。", "warning"));
+  if (hold) body.append(jsonDetails("対象の実行予約", hold, true));
+  const { fields, submit } = createForm(body, hold ? "未送信の予約を解除" : "照合完了を記録", async (form) => {
+    const reason = String(form.get("reason") || "").trim();
+    if (reason.length < 20) throw new Error("照合した操作履歴と確認根拠を20文字以上で記録してください。");
+    await api(hold ? `/recovery/unsent/${safeId(hold.plan_id)}` : "/recovery/acknowledge", { reason });
+    toast(hold ? "未送信の予約を解消しました。計画は却下されました。" : "復元前後の照合完了を記録しました。古い承認は失効したままです。");
+    await refresh(); await recoveryDetails();
+  });
+  const reason = formField(fields, "照合した履歴・時刻・結果とその根拠", "reason", { type: "textarea", full: true, hint: "20〜2000文字。正常性チェックの結果だけを根拠にしないでください。" }); reason.minLength = 20; reason.maxLength = 2000;
+  const confirmation = el("label", "check-line form-field full"); const checkbox = el("input"); checkbox.type = "checkbox";
+  append(confirmation, checkbox, document.createTextNode(hold ? "対象側の操作履歴を照合し、未送信であることを確認しました。" : "復元前後の操作履歴を照合し、新しい計画の認可を再開できることを確認しました。")); fields.append(confirmation);
+  submit.disabled = true;
+  const update = () => { submit.disabled = submit.getAttribute("aria-busy") === "true" || !can("configure") || !checkbox.checked || reason.value.trim().length < 20; };
+  checkbox.addEventListener("change", update); reason.addEventListener("input", update); submit.addEventListener("opsyne:idle", update);
+}
+function adapterForm() {
+  const source = rows("sources")[0]; const service = rows("services").find((item) => item.id === source?.service_id);
+  const definition = {
+    id: "", name: "", source_id: source?.id || "", target_instance_id: service?.instance_id || "", target_version: service?.version || 1, version: 1,
+    fields: { message: "message", outcome: "status", severity: "level" }, conditions: {},
+    outcome_map: { ok: "SUCCESS", error: "FAILURE" }, severity_map: { info: "INFO", warn: "WARNING", error: "ERROR" },
+  };
+  const body = openDialog("変換定義を作成", "DECLARATIVE ADAPTER");
+  body.append(message("項目は JSON のキーへの対応です。値の意味・対象実体・対象版・適用条件を確認してください。未知の値は正常に変換されません。"));
+  const { fields } = createForm(body, "承認待ちとして保存", async (form) => {
+    let payload;
+    try { payload = JSON.parse(form.get("definition")); } catch { throw new Error("JSON の構文に誤りがあります。括弧・カンマ・引用符を確認してください。"); }
+    await api("/adapters", payload); $("#action-dialog").close(); toast("変換定義を保存しました。別の主体による確認と承認が必要です。"); await refresh(true);
+  });
+  const editor = formField(fields, "宣言的な変換定義（JSON）", "definition", { type: "textarea", value: JSON.stringify(definition, null, 2), full: true }); editor.classList.add("json-input"); editor.spellcheck = false;
+}
+function openAdapter(record) {
+  const definition = adapterObject(record); const status = record.status || (record.active ? "ACTIVE" : "DRAFT");
+  const body = openDialog(definition.name || "変換定義", "REVIEW ADAPTER");
+  append(body, badge(status), jsonDetails("固定された定義の全体", definition, true), el("code", "digest", `SHA-256 ${record.digest || definition.digest || "未記録"}`));
+  const preview = el("div");
+  body.append(append(el("div", "card-actions"), button("標本で検証", (event) => busy(event.currentTarget, async () => {
+    const result = await api(`/adapters/${safeId(definition.id)}/validate`, {});
+    if (!Number.isInteger(result?.sample_count) || !Number.isInteger(result?.supported_count) || !Array.isArray(result?.samples)) throw new Error("標本検証の結果を確認できません。");
+    preview.replaceChildren(
+      section("保存された原本による標本検証", info([["検証した標本", result.sample_count], ["KNOWN / PARTIAL", result.supported_count]]),
+        message(result.supported_count > 0 ? "適用可能な標本が見つかりました。値の意味と適用範囲は、承認前に内容を確認してください。" : "適用可能な標本はありません。承認には対応可能な原本が必要です。", result.supported_count > 0 ? "info" : "warning"),
+        el("code", "digest", `検証対象 SHA-256 ${result.digest}`), jsonDetails("標本ごとの解釈結果", result.samples, true)),
+    );
+  }), "button")));
+  body.append(preview);
+  const actions = el("div", "form-actions");
+  if (status === "DRAFT" || status === "PENDING") {
+    const approveAllowed = can("approve") && !selfProposed(record) && Boolean(record.digest || definition.digest);
+    const confirm = el("label", "check-line"); const checkbox = el("input"); checkbox.type = "checkbox";
+    append(confirm, checkbox, document.createTextNode("対象・版・項目と値の意味・適用条件を確認し、この定義の有効化を承認します。")); body.append(confirm);
+    const approve = button("この定義を承認", (event) => busy(event.currentTarget, async () => {
+      await api(`/adapters/${safeId(definition.id)}/approve`, { digest: record.digest || definition.digest }); $("#action-dialog").close(); toast("確認した変換定義を承認しました。"); await refresh(true);
+    }), "button primary", false);
+    approve.title = approveAllowed ? "内容を確認してチェックを入れてください" : "承認権限と提案者とは異なる主体が必要です";
+    const update = () => { approve.disabled = approve.getAttribute("aria-busy") === "true" || !approveAllowed || !checkbox.checked; };
+    checkbox.addEventListener("change", update); approve.addEventListener("opsyne:idle", update); actions.append(approve);
+    if (!approveAllowed) body.append(el("p", "role-note", selfProposed(record) ? "提案者は自己承認できません。別の承認主体で確認してください。" : "承認権限を持つ主体と、記録済みの digest が必要です。"));
+  }
+  if (["ACTIVE", "APPROVED"].includes(status)) {
+    actions.append(button("原本を再解析", (event) => busy(event.currentTarget, async () => {
+      await api(`/adapters/${safeId(definition.id)}/reprocess`, {}); $("#action-dialog").close(); toast("再解析を実施しました。対象操作は実行されません。"); await refresh(true);
+    }), "button", can("operate")));
+    actions.append(button("この定義を失効", (event) => busy(event.currentTarget, async () => {
+      await api(`/adapters/${safeId(definition.id)}/revoke`, {}); $("#action-dialog").close(); toast("変換定義を失効しました。"); await refresh(true);
+    }), "button danger", can("approve")));
+  }
+  body.append(actions);
+}
+async function openCase(id) {
+  state.caseId = id;
+  const body = openDialog("案件を読み込み中…", "CASE WORKSPACE", true); const epoch = state.modalEpoch;
+  body.append(append(el("div", "loading-card"), el("span", "spinner"), el("p", "", "根拠と対応状況を取得しています…")));
+  try {
+    const detail = await api(`/cases/${safeId(id)}`);
+    if (epoch !== state.modalEpoch || !$("#action-dialog").open) return;
+    renderCaseDetail(body, detail);
+  } catch (error) { if (epoch === state.modalEpoch) body.replaceChildren(message(error.message, "error")); }
+}
+function section(title, ...children) { return append(el("section", "detail-section"), el("h3", "", title), ...children); }
+function renderCaseDetail(body, detail) {
+  const item = detail.case; $("#dialog-title").textContent = item.title || item.id; body.replaceChildren();
+  const statusNode = badge(item.status);
+  append(body, append(el("div", "detail-topline"), severity(item.severity), statusNode, el("code", "detail-id", item.id)), info([["対象サービス", serviceName(item.service_id)], ["観測源", sourceName(item.source_id)], ["作成日時", date(item.created_at, true)], ["更新日時", date(item.updated_at, true)]]));
+  const actions = append(el("div", "detail-actions"), button("調査を実行", (event) => busy(event.currentTarget, async () => {
+    await api(`/cases/${safeId(item.id)}/investigate`, {}); toast("調査タスクを受け付けました。完了後に調査結果へ反映されます。"); await refresh(); await openCase(item.id);
+  }), "button primary", can("operate")), button("変換定義の提案を依頼", (event) => busy(event.currentTarget, async () => {
+    await api(`/cases/${safeId(item.id)}/adapter-proposal`, {}); toast("変換定義の提案タスクを受け付けました。提案は変換定義画面で確認・承認できます。"); await refresh(); await openCase(item.id);
+  }), "button", can("operate")), button("対応計画を作成", () => planForm(item), "button", can("operate")), button("↻ 更新", () => openCase(item.id), "button"));
+  body.append(section("対応を進める", actions));
+  const liveTasks = el("div"); append(liveTasks, latestTask(item.id)); body.append(liveTasks);
+  const analysis = detail.analysis || item.analysis;
+  const liveAnalysis = section("調査結果", analysis ? renderAnalysis(analysis) : message("調査結果はまだ得られていません。根拠のある事実・仮説・不足情報を分けて記録します。")); body.append(liveAnalysis);
+  const evidence = Array.isArray(detail.evidence) ? detail.evidence : [];
+  const evidenceSection = section(`根拠と原本 (${evidence.length})`);
+  if (!evidence.length) evidenceSection.append(message("参照できる原本はありません。観測停止の案件などでは、収集状態が根拠になります。"));
+  for (const entry of evidence) {
+    const raw = entry.raw || entry; const node = el("div", "evidence-item");
+    const parseStatus = entry.interpretation?.parse_status;
+    append(node, append(el("div", "evidence-meta"), el("code", "", raw.id || entry.raw_ref || "原本"), el("span", "", date(raw.received_at || raw.observed_at)), parseStatus === "UNKNOWN" ? el("span", "badge amber", "未知形式") : parseStatus ? badge(parseStatus) : null));
+    if (raw.payload !== undefined) node.append(el("pre", "", raw.payload));
+    node.append(jsonDetails("原本参照・派生解釈・版を確認", entry)); evidenceSection.append(node);
+  }
+  body.append(evidenceSection);
+  const plans = Array.isArray(detail.plans) ? detail.plans : [];
+  const planSection = section(`対応計画 (${plans.length})`);
+  if (!plans.length) planSection.append(el("p", "analysis-text", "対応計画はまだ作成されていません。登録済みの操作能力から計画を作成できます。"));
+  for (const record of plans) planSection.append(planCard(record, item)); body.append(planSection);
+  const executions = Array.isArray(detail.executions) ? detail.executions : [];
+  const executionSection = section(`実行台帳と独立確認 (${executions.length})`);
+  if (!executions.length) executionSection.append(el("p", "analysis-text", "実行記録はありません。操作の前に意図を永続化し、結果不明は照合まで保留します。"));
+  for (const execution of executions) executionSection.append(executionCard(execution, item)); body.append(executionSection);
+  state.caseLive = { id: item.id, epoch: state.modalEpoch, analysis: liveAnalysis, analysisValue: JSON.stringify(analysis), tasks: liveTasks, tasksValue: JSON.stringify(rows("tasks")), status: statusNode };
+}
+function latestTask(caseId) {
+  const tasks = rows("tasks").filter((task) => task.case_id === caseId).sort((left, right) => right.created_at - left.created_at);
+  if (!tasks.length) return null;
+  const latest = tasks[0];
+  return section(`最新のタスク · ${taskRoleNames[latest.role] || latest.role}`, badge(latest.status === "SUCCEEDED" ? "COMPLETED" : latest.status), el("p", "analysis-text", latest.detail || (["RUNNING", "PENDING"].includes(latest.status) ? "処理を受け付けています。状態と調査結果は10秒ごとに取得します。" : "タスクの状態を記録しました。")), el("p", "field-hint", `${latest.id} · ${date(latest.created_at, true)}`));
+}
+async function refreshCaseSignals() {
+  const live = state.caseLive;
+  const detail = await api(`/cases/${safeId(live.id)}`);
+  if (live !== state.caseLive || live.epoch !== state.modalEpoch) return;
+  const status = badge(detail.case.status); live.status.className = status.className; live.status.textContent = status.textContent;
+  const analysis = detail.analysis || detail.case.analysis;
+  const serialized = JSON.stringify(analysis);
+  // Leave plan-review inputs, expanded evidence, and focused controls in place.
+  if (serialized !== live.analysisValue && !live.analysis.contains(document.activeElement)) {
+    live.analysis.replaceChildren(el("h3", "", "調査結果"), analysis ? renderAnalysis(analysis) : message("調査結果はまだ記録されていません。"));
+    live.analysisValue = serialized;
+  }
+  const serializedTasks = JSON.stringify(rows("tasks"));
+  if (serializedTasks !== live.tasksValue) {
+    live.tasks.replaceChildren(); append(live.tasks, latestTask(live.id)); live.tasksValue = serializedTasks;
+  }
+}
+function renderAnalysis(analysis) {
+  const wrapper = el("div");
+  if (analysis.status) wrapper.append(badge(analysis.status));
+  const content = analysis.output || analysis.result || analysis;
+  if (content.summary) wrapper.append(el("p", "analysis-text", content.summary));
+  for (const [field, title] of [["facts", "事実"], ["hypotheses", "仮説"], ["unknowns", "不明点"], ["recommendations", "提案"]]) {
+    if (!content[field]?.length) continue;
+    wrapper.append(el("h3", "", title)); const list = el("ul", "detail-list");
+    for (const entry of content[field]) {
+      const claim = el("li", "", typeof entry === "string" ? entry : entry.text || JSON.stringify(entry));
+      if (entry.evidence_ids?.length) claim.append(el("div", "field-hint", `根拠: ${entry.evidence_ids.join(", ")}`));
+      list.append(claim);
+    }
+    wrapper.append(list);
+  }
+  wrapper.append(jsonDetails("調査の全体・根拠・実行状態", analysis)); return wrapper;
+}
+function planCard(record, item) {
+  const plan = planObject(record); const card = el("article", "plan-card");
+  append(card, append(el("div", "plan-card-header"), el("h4", "", plan.capability_id || plan.id), badge(record.status || "DRAFT")), info([["対象 / 版", `${plan.target_instance_id} / v${plan.target_version}`], ["有効期限", date(plan.expires_at, true)], ["提案者", plan.proposer || record.proposed_by], ["提案理由", plan.reason]]));
+  const actions = el("div", "card-actions");
+  actions.append(button("固定計画を確認", () => reviewPlan(record, item), "button small"));
+  if (record.status === "APPROVED") actions.append(button("実行条件を確認・実行", () => reviewPlan(record, item, true), "button primary small", can("operate")));
+  card.append(actions); return card;
+}
+async function planForm(item) {
+  const body = openDialog("対応計画を作成", "PROPOSE A PLAN"); const epoch = state.modalEpoch;
+  body.append(message("登録された型付き操作能力から選択します。保存した計画は別の主体が内容を確認し、承認後に実行できます。"));
+  try {
+    const response = await api("/capabilities");
+    if (state.modalEpoch !== epoch) return;
+    const capabilities = (Array.isArray(response) ? response : response.capabilities || []).filter((capability) => capability.service_id === item.service_id);
+    if (!capabilities.length) { body.append(message("このサービスには操作能力が登録されていません。管理者がサーバー設定に許可された操作と独立確認方法を登録してください。", "warning")); return; }
+    const { fields } = createForm(body, "計画を保存", async (form) => {
+      await api(`/cases/${safeId(item.id)}/plans`, Object.fromEntries(form)); toast("固定された対応計画を作成しました。"); await refresh(); await openCase(item.id);
+    });
+    formField(fields, "操作能力", "capability_id", { full: true, options: capabilities.map((capability) => [capability.id, `${capability.name} (${capability.id} / v${capability.version})`]) });
+    formField(fields, "対応する理由", "reason", { full: true, type: "textarea", hint: "根拠と、対応が必要と判断した理由を記載してください。" });
+    body.append(jsonDetails("登録された操作能力", capabilities));
+  } catch (error) { if (state.modalEpoch === epoch) body.append(message(error.message, "error")); }
+}
+function reviewPlan(record, item, execute = false) {
+  const plan = planObject(record); const status = record.status || "DRAFT";
+  const body = openDialog(execute ? "固定計画を確認して実行" : "固定計画のレビュー", "PLAN REVIEW", true);
+  const epoch = state.modalEpoch;
+  let operationReady = false;
+  let updateApprovalState = () => {};
+  append(body, badge(status), info([["計画 ID", plan.id], ["提案者", plan.proposer], ["対象サービス", serviceName(plan.service_id)], ["対象実体 / 版", `${plan.target_instance_id} / v${plan.target_version}`], ["操作能力 / 版", `${plan.capability_id} / v${plan.capability_version}`], ["有効期限", date(plan.expires_at, true)]]));
+  for (const [key, title] of [["reason", "対応理由"], ["impact", "想定される影響"], ["success_condition", "独立して確認する成功条件"], ["abort_condition", "中止条件"]]) body.append(section(title, el("p", "analysis-text", plan[key] || "未記録")));
+  body.append(section("証拠参照", el("code", "", (plan.evidence_ids || []).join("\n") || "参照なし")));
+  const operationSection = section("操作の内容", el("p", "analysis-text", "登録された操作能力の内容を取得しています…"));
+  body.append(operationSection);
+  api("/capabilities").then((response) => {
+    if (state.modalEpoch !== epoch) return;
+    const operation = (Array.isArray(response) ? response : response.capabilities || []).find((capability) => capability.id === plan.capability_id && capability.version === plan.capability_version);
+    operationSection.replaceChildren(el("h3", "", "操作の内容"));
+    if (operation) {
+      operationSection.append(jsonDetails(`単一操作: ${operation.name} / v${operation.version}`, operation, true));
+      operationReady = true; updateApprovalState();
+    }
+    else operationSection.append(message("計画に記録された版の操作能力を取得できません。承認前に登録内容を確認してください。", "warning"));
+  }).catch((error) => { if (state.modalEpoch === epoch) operationSection.replaceChildren(message(error.message, "error")); });
+  body.append(jsonDetails("承認対象の固定計画（すべてのフィールド）", plan, true));
+  body.append(el("code", "digest", `SHA-256 ${plan.digest || "未記録"}`));
+  const expired = Number(plan.expires_at) * 1000 <= Date.now();
+  if (expired) body.append(message("この計画は期限切れです。新しい計画を作成して、改めて確認・承認してください。", "warning"));
+  const isSelf = selfProposed(plan);
+  if (status === "DRAFT" && isSelf) body.append(el("p", "role-note", "提案者は自己承認できません。別の承認主体で内容を確認してください。"));
+  if (execute && status === "APPROVED") body.append(message("実行直前に現在の対象・版・権限・承認期限と競合を再照合します。操作成功後も、独立確認が完了するまでは案件を解決しません。", "warning"));
+  if (status === "DRAFT" || (execute && status === "APPROVED")) {
+    const confirm = el("label", "check-line"); const checkbox = el("input"); checkbox.type = "checkbox";
+    append(confirm, checkbox, document.createTextNode(execute ? "固定計画の対象・操作・影響を確認しました。この計画の実行を要求します。" : "対象・版・根拠・影響・成功条件・中止条件・期限を確認しました。この固定計画を承認します。")); body.append(confirm);
+    const allowed = !expired && Boolean(plan.digest) && (execute ? can("operate") : can("approve") && !isSelf);
+    const actions = el("div", "form-actions");
+    if (!execute) actions.append(button("却下する", () => rejectForm(plan, item), "button danger", can("approve")));
+    const submit = button(execute ? "この計画を実行" : "この計画を承認", (event) => busy(event.currentTarget, async () => {
+      await api(`/plans/${safeId(plan.id)}/${execute ? "execute" : "approve"}`, execute ? {} : { digest: plan.digest });
+      toast(execute ? "実行要求を処理しました。台帳と独立確認の結果を確認してください。" : "固定計画を承認しました。実行時に現在の条件を照合します。");
+      await refresh(); await openCase(item.id);
+    }), "button primary", false);
+    updateApprovalState = () => {
+      submit.disabled = submit.getAttribute("aria-busy") === "true" || !allowed || !checkbox.checked || !operationReady;
+      submit.title = !allowed ? "役割・提案者・有効期限を確認してください" : !operationReady ? "操作能力の内容を取得しています" : !checkbox.checked ? "内容を確認してチェックを入れてください" : "";
+    };
+    updateApprovalState();
+    checkbox.addEventListener("change", updateApprovalState); submit.addEventListener("opsyne:idle", updateApprovalState); actions.append(submit); body.append(actions);
+  }
+}
+function rejectForm(plan, item) {
+  const body = openDialog("計画を却下", "REJECT PLAN");
+  const { fields } = createForm(body, "理由を記録して却下", async (form) => {
+    await api(`/plans/${safeId(plan.id)}/reject`, { reason: form.get("reason") }); toast("計画を却下しました。"); await refresh(); await openCase(item.id);
+  });
+  formField(fields, "却下理由", "reason", { type: "textarea", full: true });
+}
+function executionCard(execution, item) {
+  const card = el("article", "plan-card");
+  append(card, append(el("div", "plan-card-header"), el("h4", "", execution.id), badge(execution.status)), info([["計画", execution.plan_id], ["最終更新", date(execution.updated_at, true)]]));
+  if (execution.result?.detail) card.append(el("p", "analysis-text", execution.result.detail));
+  if (execution.status === "UNKNOWN") card.append(message("操作結果は不明です。独立確認で状態が改善していても、この操作の照合が必要です。無条件の再送は行いません。", "warning"));
+  const check = el("div", "verification-card");
+  append(check, el("h3", "", "独立した結果確認"), badge(execution.verification?.status), el("p", "", execution.verification?.detail || "まだ確認されていません。操作の成功応答だけでは復旧と判断しません。")); card.append(check);
+  const actions = el("div", "card-actions");
+  if (["UNKNOWN", "IN_FLIGHT", "PENDING"].includes(execution.status)) actions.append(button("操作結果を照合", (event) => busy(event.currentTarget, async () => {
+    await api(`/executions/${safeId(execution.id)}/reconcile`, {}); toast("照合結果を更新しました。"); await refresh(); await openCase(item.id);
+  }), "button small", can("operate")));
+  actions.append(button("独立確認を実行", (event) => busy(event.currentTarget, async () => {
+    await api(`/executions/${safeId(execution.id)}/verify`, {}); toast("独立確認の結果を記録しました。"); await refresh(); await openCase(item.id);
+  }), "button small", can("operate")));
+  append(card, actions, jsonDetails("実行台帳の全体", execution)); return card;
+}
+
+$("#auth-form").addEventListener("submit", async (event) => {
+  event.preventDefault(); const submit = $("#auth-form button"); if (submit.disabled) return; submit.disabled = true;
+  $("#auth-error").hidden = true;
+  try { await connect($("#auth-token").value.trim()); }
+  catch (error) { $("#auth-error").textContent = error.message; $("#auth-error").hidden = false; }
+  finally { submit.disabled = false; }
+});
+$("#auth-dialog").addEventListener("cancel", (event) => { if (!state.session) event.preventDefault(); });
+$("#session-button").addEventListener("click", () => {
+  if (!state.session) { $("#auth-dialog").showModal(); return; }
+  const body = openDialog("接続中のセッション", "SESSION");
+  append(body, info([["主体", state.session.actor], ["役割", roleNames[state.session.role] || state.session.role]]), message("承認には提案者と異なる主体が必要です。接続を切り替えると現在のトークンはこのタブから削除されます。"), append(el("div", "form-actions"), button("切断して別の主体で接続", () => disconnect(), "button")));
+});
+$("#refresh-button").addEventListener("click", (event) => busy(event.currentTarget, () => refresh(true)));
+$("#dialog-close").addEventListener("click", () => $("#action-dialog").close());
+$("#action-dialog").addEventListener("close", () => { state.modalEpoch += 1; });
+window.addEventListener("hashchange", navigate);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+setInterval(() => { if (!document.hidden) refresh(); }, 10000);
+navigate();
+if (state.token) connect(state.token).catch(() => disconnect("保存したトークンでは接続できませんでした。再接続してください。"));
+else disconnect();

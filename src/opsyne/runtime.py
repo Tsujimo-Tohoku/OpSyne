@@ -1,0 +1,522 @@
+"""Local composition root. Product domains never import this module."""
+
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import threading
+import time
+from contextlib import suppress
+from pathlib import Path
+from typing import Any
+
+from opsyne.agents.adapter import AdapterAgent
+from opsyne.agents.investigator import Investigator
+from opsyne.collector.service import Collector
+from opsyne.connectors.demo import DemoConnector
+from opsyne.connectors.http import HttpConnector
+from opsyne.contracts.cases import Analysis, Case, EvidenceGrant, Task
+from opsyne.contracts.core import Actor, Service
+from opsyne.contracts.execution import Capability, CheckConfig, Execution, VerificationResult
+from opsyne.contracts.observations import AdapterDefinition, Finding, RawEvent, RawInput, Source
+from opsyne.control.adapters import AdapterRegistry
+from opsyne.control.repository import Control, Denied
+from opsyne.detection.engine import detect, detect_coverage
+from opsyne.gateway.service import EvidenceGateway
+from opsyne.normalization.engine import normalize
+from opsyne.runner.service import Runner
+from opsyne.storage.instance import InstanceLock
+from opsyne.verification.service import VerificationService
+
+
+class Runtime:
+    def __init__(
+        self,
+        data_dir: Path,
+        api_key: str | None = None,
+        daily_call_limit: int = 20,
+        auto_investigate: bool = False,
+    ) -> None:
+        self.data_dir = data_dir.resolve()
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        if (self.data_dir / "restore.pending").exists():
+            raise ValueError("復元が未完了です。完全なバックアップから新しい場所へ復元してください")
+        databases = ("control.sqlite3", "collector.sqlite3", "runner.sqlite3", "demo.sqlite3")
+        present = [name for name in databases if (self.data_dir / name).exists()]
+        if present and (
+            len(present) != len(databases) or not (self.data_dir / "signing.key").exists()
+        ):
+            raise ValueError(
+                "保存状態が不完全です。DBと署名鍵を揃えたバックアップから復元してください"
+            )
+        if not 1 <= daily_call_limit <= 1000:
+            raise ValueError("日次LLM呼出上限は1から1000の範囲で設定してください")
+        key_path = self.data_dir / "signing.key"
+        if not key_path.exists():
+            try:
+                descriptor = os.open(key_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(descriptor, "wb") as file:
+                    file.write(secrets.token_bytes(32))
+                    file.flush()
+                    os.fsync(file.fileno())
+            except FileExistsError:
+                pass
+        self.control = Control(self.data_dir / "control.sqlite3", key_path.read_bytes())
+        self.collector = Collector(self.data_dir / "collector.sqlite3")
+        self.runner = Runner(self.data_dir / "runner.sqlite3")
+        self.demo = DemoConnector(self.data_dir / "demo.sqlite3")
+        self.http = HttpConnector()
+        self.verifier = VerificationService()
+        self.adapters = AdapterRegistry(self.control, self.source)
+        self.investigator = Investigator(api_key=api_key, model="gpt-5.6-luna")
+        self.adapter_agent = AdapterAgent(api_key=api_key, model="gpt-5.6-luna")
+        self.llm_configured = bool(api_key)
+        self.daily_call_limit = daily_call_limit
+        self.auto_investigate = auto_investigate
+        self.gateway = EvidenceGateway(self.collector.raw, self.validate_grant)
+        self._stop = threading.Event()
+        self._lock = threading.RLock()
+        self._execution_lock = threading.RLock()
+        self._instance = InstanceLock(self.data_dir / "instance.lock")
+        self._threads: list[threading.Thread] = []
+        self.last_poll: float | None = None
+        self.last_poll_error: str | None = None
+        self.last_task_error: str | None = None
+
+    def source(self, source_id: str) -> Source:
+        for source in self.collector.sources():
+            if source.id == source_id:
+                return source
+        raise KeyError(source_id)
+
+    def start(self) -> None:
+        self._instance.acquire()
+        try:
+            self.runner.recover_in_flight()
+            self.control.recover_tasks()
+        except BaseException:
+            self._instance.release()
+            raise
+        self._stop.clear()
+        for target, name in [
+            (self._observation_loop, "opsyne-collector"),
+            (self._investigation_loop, "opsyne-investigator"),
+        ]:
+            thread = threading.Thread(target=target, name=name, daemon=True)
+            self._threads.append(thread)
+            thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        for thread in self._threads:
+            thread.join(timeout=35)
+        if any(thread.is_alive() for thread in self._threads):
+            raise RuntimeError("処理の停止待ちです。状態ロックを維持します")
+        self._threads.clear()
+        self._instance.release()
+
+    def _observation_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.poll()
+            except Exception as exc:
+                self.last_poll_error = type(exc).__name__
+                with suppress(Exception):
+                    self.control.audit("collector", "poll.failed", "system", type(exc).__name__)
+            self._stop.wait(2)
+
+    def _investigation_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.run_task()
+                self.last_task_error = None
+            except Exception as exc:
+                self.last_task_error = type(exc).__name__
+                with suppress(Exception):
+                    self.control.audit("agent", "worker.failed", "system", type(exc).__name__)
+            self._stop.wait(1)
+
+    def _finding(self, finding: Finding) -> Case:
+        return self.control.add_finding(
+            finding.dedup_key,
+            finding.service_id,
+            finding.source_id,
+            finding.kind,
+            finding.title,
+            finding.severity,
+            finding.evidence_ids,
+        )
+
+    def process(self, raw: RawEvent, reprocess: bool = False) -> None:
+        service = self.control.service(raw.service_id)
+        event = normalize(
+            raw,
+            self.adapters.active(),
+            target_instance_id=service.instance_id,
+            target_version=service.version,
+        )
+        self.control.record_event(raw.id, event.model_dump(mode="json"))
+        if not reprocess:
+            for finding in detect(event):
+                case = self._finding(finding)
+                if self.auto_investigate and self.llm_configured and case.status == "OPEN":
+                    self.control.enqueue(
+                        case.id, "security" if finding.kind == "security" else "operator"
+                    )
+        if reprocess:
+            self.collector.record_parse_status(raw.id, event.parse_status)
+        else:
+            self.collector.ack(raw.id, event.parse_status)
+
+    def poll(self) -> dict[str, Any]:
+        with self._lock:
+            received = self.collector.poll_files()
+            processed = 0
+            for raw in self.collector.pending(100):
+                self.process(raw)
+                processed += 1
+            for coverage in self.collector.coverage():
+                for finding in detect_coverage(coverage):
+                    self._finding(finding)
+            self.last_poll = time.time()
+            self.last_poll_error = None
+            return {"received": len(received), "processed": processed, "at": self.last_poll}
+
+    def reprocess(self, source_id: str) -> dict[str, int]:
+        count = 0
+        for raw in self.collector.iter_raw(source_id):
+            with self._lock:
+                self.process(raw, reprocess=True)
+                count += 1
+        self.control.audit("normalizer", "source.reprocess", source_id, str(count))
+        return {"reprocessed": count}
+
+    def validate_adapter(self, adapter_id: str) -> dict[str, Any]:
+        """Preview a fixed draft on bounded samples without changing interpretations."""
+        body = self.control.get("adapter", adapter_id)
+        definition = self.adapters.definition(body)
+        source = self.source(definition.source_id)
+        service = self.control.service(source.service_id)
+        samples = [
+            normalize(
+                raw,
+                [definition],
+                target_instance_id=service.instance_id,
+                target_version=service.version,
+            ).model_dump(mode="json")
+            for raw in self.collector.search(source_id=source.id, limit=20)
+        ]
+        return {
+            "digest": body["digest"],
+            "sample_count": len(samples),
+            "supported_count": sum(
+                item["parse_status"] in {"KNOWN", "PARTIAL"} for item in samples
+            ),
+            "samples": samples,
+        }
+
+    def check(self, service_id: str) -> VerificationResult:
+        config = CheckConfig.model_validate(self.control.get("check", service_id))
+        if config.kind == "demo":
+            return self.verifier.verify(lambda: self.demo.check(service_id))
+        return self.verifier.verify(lambda: self.http.check(config))
+
+    def execute(self, plan_id: str, actor: Actor) -> Execution:
+        if actor.role not in {"admin", "operator"}:
+            raise Denied("実行権限が必要です")
+        with self._execution_lock:
+            existing = self.runner.for_plan(plan_id)
+            if existing is not None:
+                self.control.execution_finished(plan_id, existing.status)
+                return existing
+            plan = self.control.plan_model(self.control.get("plan", plan_id))
+            capability = Capability.model_validate(
+                self.control.get("capability", plan.capability_id)
+            )
+            before = self.check(plan.service_id)
+            if before.status != "FAIL":
+                raise Denied(
+                    "事前確認がFAILではありません。正常または確認不能な対象には操作しません"
+                )
+            permit = self.control.issue_permit(plan_id)
+
+            def authorize() -> None:
+                self.control.verify_permit(permit)
+                if self.check(plan.service_id).status != "FAIL":
+                    raise Denied("実行直前の事前条件が成立しません")
+                self.control.verify_permit(permit)
+
+            try:
+                result = self.runner.execute(
+                    plan,
+                    permit,
+                    capability,
+                    authorize,
+                    lambda operation_id: (
+                        self.demo.execute(plan.service_id, operation_id)
+                        if capability.kind == "demo.restore"
+                        else self.http.execute(capability, operation_id)
+                    ),
+                )
+            except Exception:
+                recorded = self.runner.for_plan(plan_id)
+                if recorded is not None:
+                    self.control.execution_finished(plan_id, recorded.status)
+                raise
+            self.control.execution_finished(plan_id, result.status)
+            status = {"SUCCEEDED": "VERIFYING", "FAILED": "OPEN"}.get(result.status, "EXECUTING")
+            self.control.case_status(plan.case_id, status)
+            self.control.audit(actor.actor, "execution.request", result.id, result.status)
+            return result
+
+    def reconcile(self, execution_id: str, actor: Actor) -> Execution:
+        if actor.role not in {"admin", "operator"}:
+            raise Denied("照合権限が必要です")
+        with self._execution_lock:
+            execution = self.runner.get(execution_id)
+            plan = self.control.plan_model(self.control.get("plan", execution.plan_id))
+            capability = Capability.model_validate(
+                self.control.get("capability", plan.capability_id)
+            )
+            result = self.runner.reconcile(
+                execution_id,
+                self.demo.lookup if capability.kind == "demo.restore" else self.http.lookup,
+            )
+            self.control.execution_finished(plan.id, result.status)
+            self.control.audit(actor.actor, "execution.reconcile", execution_id, result.status)
+            return result
+
+    def verify(self, execution_id: str, actor: Actor) -> VerificationResult:
+        with self._execution_lock:
+            execution = self.runner.get(execution_id)
+            plan = self.control.plan_model(self.control.get("plan", execution.plan_id))
+            service = self.control.service(plan.service_id)
+            if (service.instance_id, service.version) != (
+                plan.target_instance_id,
+                plan.target_version,
+            ):
+                raise Denied("実行時の対象と現在の対象が異なります")
+            result = self.check(plan.service_id)
+            with self.control.db.connection() as db:
+                self.control._put(db, "verification", execution_id, result.model_dump(mode="json"))
+                self.control._audit(
+                    db, actor.actor, "execution.verify", execution_id, result.status
+                )
+            # Availability recovery does not establish parsing correctness or SOC eradication.
+            if result.status == "PASS" and execution.status == "SUCCEEDED":
+                self.control.resolve_verified_operation(plan)
+            return result
+
+    def validate_grant(self, grant: EvidenceGrant) -> None:
+        task = Task.model_validate(self.control.get("task", grant.task_id))
+        case = Case.model_validate(self.control.get("case", task.case_id))
+        service = self.control.service(task.service_id)
+        if (
+            task.status != "RUNNING"
+            or task.expires_at <= time.time()
+            or not service.enabled
+            or (task.case_id, task.service_id, task.role)
+            != (grant.case_id, grant.service_id, grant.role)
+            or not set(grant.evidence_ids).issubset(case.evidence_ids)
+        ):
+            raise Denied("現在のtaskまたは案件の証拠範囲が無効です")
+
+    def run_task(self) -> Task | None:
+        task = self.control.claim_task(self.daily_call_limit)
+        if task is None:
+            return None
+        try:
+            case = Case.model_validate(self.control.get("case", task.case_id))
+            grant = EvidenceGrant(
+                task_id=task.id,
+                case_id=task.case_id,
+                service_id=task.service_id,
+                role=task.role,
+                evidence_ids=tuple(case.evidence_ids[:20]),
+                expires_at=task.expires_at,
+            )
+            evidence = self.gateway.retrieve(grant)
+            self.control.audit(
+                f"agent:{task.role}", "evidence.retrieve", task.id, str(len(evidence))
+            )
+            if task.role == "adapter":
+                source = self.source(case.source_id)
+                service = self.control.service(task.service_id)
+                proposal = self.adapter_agent.propose(task, evidence, source, service)
+                self.validate_grant(grant)
+                if (
+                    self.control.service(task.service_id) != service
+                    or self.source(source.id) != source
+                ):
+                    raise Denied("変換調査中に対象または観測源が変更されました")
+                recommendations = []
+                if proposal.fields:
+                    definition = proposal.to_definition(f"adapter-{task.id}", source, service)
+                    self.adapters.propose(definition, "agent:adapter")
+                    recommendations.append(f"変換定義 {definition.id} の内容・意味を確認して承認")
+                analysis = Analysis(
+                    summary="変換定義を提案しました" if proposal.fields else "変換定義の提案を保留",
+                    facts=[],
+                    hypotheses=proposal.rationale,
+                    unknowns=proposal.unknowns,
+                    recommendations=recommendations,
+                )
+            else:
+                analysis = self.investigator.investigate(task, evidence)
+                self.validate_grant(grant)
+            self.control.finish_task(task, analysis)
+        except Exception as exc:
+            detail = (
+                "OPENAI_API_KEYが未設定です"
+                if not self.llm_configured
+                else f"調査失敗: {type(exc).__name__}"
+            )
+            self.control.finish_task(task, None, detail)
+        return Task.model_validate(self.control.get("task", task.id))
+
+    def case_detail(self, case_id: str) -> dict[str, Any]:
+        case = self.control.get("case", case_id)
+        evidence = []
+        for raw_id in case["evidence_ids"]:
+            raw = self.collector.raw(raw_id)
+            if raw is not None:
+                evidence.append(
+                    {**raw.model_dump(mode="json"), "interpretation": self.control.event(raw_id)}
+                )
+        plans = [item for item in self.control.objects("plan") if item["case_id"] == case_id]
+        ids = {item["id"] for item in plans}
+        try:
+            analysis = self.control.get("analysis", case_id)
+        except KeyError:
+            analysis = None
+        return {
+            "case": case,
+            "evidence": evidence,
+            "plans": plans,
+            "executions": [item for item in self.execution_list() if item["plan_id"] in ids],
+            "analysis": analysis,
+        }
+
+    def execution_list(self) -> list[dict[str, Any]]:
+        items = []
+        for execution in self.runner.list():
+            body = execution.model_dump(mode="json")
+            with suppress(KeyError):
+                body["verification"] = self.control.get("verification", execution.id)
+            items.append(body)
+        return items
+
+    def overview(self) -> dict[str, Any]:
+        return {
+            "services": self.control.objects("service"),
+            "sources": [source.model_dump(mode="json") for source in self.collector.sources()],
+            "cases": self.control.objects("case")[:500],
+            "plans": self.control.objects("plan")[:500],
+            "executions": self.execution_list()[-500:],
+            "adapters": self.control.objects("adapter"),
+            "coverage": [item.model_dump(mode="json") for item in self.collector.coverage()],
+            "audit": self.control.audit_log(),
+            "tasks": self.control.objects("task")[:200],
+            "llm": {
+                "model": "gpt-5.6-luna",
+                "configured": self.llm_configured,
+                "daily_call_limit": self.daily_call_limit,
+            },
+            "worker": {
+                "last_poll": self.last_poll,
+                "error": self.last_poll_error,
+                "investigation_error": self.last_task_error,
+            },
+        }
+
+    def seed_demo(self, actor: Actor) -> dict[str, Any]:
+        with self._lock:
+            service = Service(
+                id="demo-checkout",
+                name="Checkout / サンプル",
+                instance_id="demo-checkout-v1",
+                owner=actor.actor,
+                criticality="high",
+            )
+            self.control.register_service(service, actor.actor)
+            self.control.set_check(service.id, CheckConfig(kind="demo"), actor.actor)
+            self.control.register_capability(
+                Capability(
+                    id="demo-restore",
+                    service_id=service.id,
+                    name="サンプルサービスの復旧",
+                    kind="demo.restore",
+                ),
+                actor.actor,
+            )
+            source = Source(
+                id="demo-log",
+                service_id=service.id,
+                name="サンプルログ",
+                kind="push",
+                stale_after_seconds=86400,
+            )
+            self.collector.register_source(source)
+            try:
+                self.control.get("adapter", "demo-json-v1")
+            except KeyError:
+                self.adapters.propose(
+                    AdapterDefinition(
+                        id="demo-json-v1",
+                        name="サンプルJSON",
+                        source_id=source.id,
+                        target_instance_id=service.instance_id,
+                        target_version=1,
+                        version=1,
+                        fields={
+                            "category": "category",
+                            "message": "message",
+                            "outcome": "result",
+                            "severity": "level",
+                        },
+                        conditions={"format": "opsyne-demo-v1"},
+                        outcome_map={"error": "FAILURE", "ok": "SUCCESS"},
+                        severity_map={"error": "ERROR", "info": "INFO"},
+                    ),
+                    "system:demo",
+                )
+            # Idempotent setup does not reset an already restored service.
+            marker = self.data_dir / "demo-seeded"
+            if not marker.exists():
+                self.demo.configure(service.id, healthy=False)
+                marker.write_text("1", encoding="utf-8")
+            raw = self.collector.ingest(
+                source.id,
+                [
+                    RawInput(
+                        external_id="sample-failure-1",
+                        payload=json.dumps(
+                            {
+                                "format": "opsyne-demo-v1",
+                                "category": "availability",
+                                "result": "error",
+                                "level": "error",
+                                "message": "注文処理が失敗しました。合成データです。",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                ],
+            )[0]
+            # The synthetic failure comes from an independent local business observation.
+            self.control.add_finding(
+                "demo-business-failure",
+                service.id,
+                source.id,
+                "operation_failure",
+                "サンプル: 注文処理を復旧してください",
+                "ERROR",
+                [raw.id],
+            )
+            self.poll()
+            self.control.audit(actor.actor, "demo.create", service.id, "合成データのみ")
+            return {
+                "service_id": service.id,
+                "message": "合成データを用意しました。変換定義は別途承認してください。",
+            }

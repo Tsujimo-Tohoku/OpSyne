@@ -1,0 +1,75 @@
+[importlinter]
+root_package = opsyne
+exclude_type_checking_imports = False
+
+[importlinter:contract:contracts-independent]
+name = Shared contracts do not depend on product domains
+type = forbidden
+source_modules =
+    opsyne.contracts
+forbidden_modules =
+    opsyne.collector
+    opsyne.normalization
+    opsyne.detection
+    opsyne.control
+    opsyne.gateway
+    opsyne.agents
+    opsyne.runner
+    opsyne.verification
+    opsyne.connectors
+    opsyne.storage
+    opsyne.runtime
+    opsyne.api
+    opsyne.cli
+allow_indirect_imports = False
+
+[importlinter:contract:domain-independence]
+name = Product domains communicate through contracts
+type = independence
+modules =
+    opsyne.collector
+    opsyne.normalization
+    opsyne.detection
+    opsyne.control
+    opsyne.gateway
+    opsyne.agents
+    opsyne.runner
+    opsyne.verification
+    opsyne.connectors
+
+[importlinter:contract:composition-inward]
+name = Product domains and storage do not depend on application composition
+type = forbidden
+source_modules =
+    opsyne.collector
+    opsyne.normalization
+    opsyne.detection
+    opsyne.control
+    opsyne.gateway
+    opsyne.agents
+    opsyne.runner
+    opsyne.verification
+    opsyne.connectors
+    opsyne.storage
+forbidden_modules =
+    opsyne.runtime
+    opsyne.api
+    opsyne.cli
+allow_indirect_imports = False
+
+[importlinter:contract:storage-independent]
+name = Storage primitives do not depend on product domains
+type = forbidden
+source_modules =
+    opsyne.storage
+forbidden_modules =
+    opsyne.collector
+    opsyne.normalization
+    opsyne.detection
+    opsyne.control
+    opsyne.gateway
+    opsyne.agents
+    opsyne.runner
+    opsyne.verification
+    opsyne.connectors
+allow_indirect_imports = False
