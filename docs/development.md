@@ -67,7 +67,7 @@ Pythonの対応版変更は `.python-version`、`requires-python`、Ruff/mypy設
 
 ## テストと設計の関係
 
-pytestは、パッケージ利用に加え、重複・原本の不変性・ファイル回転・保存失敗・再起動・承認・期限・署名・実行の結果不明・独立検証・復元を確認します。OpenAI SDKの要求／応答は `httpx.MockTransport` で検査します。模擬試験の成功は、実アカウントでのモデル利用可否や実サービスの復旧成功を意味しません。
+pytestは、パッケージ利用に加え、重複・原本の不変性・ファイル回転・保存失敗・再起動・承認・期限・署名・実行の結果不明・独立検証・復元を確認します。OpenAI SDK 3の要求／応答は `httpx2.MockTransport` で検査します。HTTP Connectorの試験には `httpx.MockTransport` を使用します。模擬試験の成功は、実アカウントでのモデル利用可否や実サービスの復旧成功を意味しません。
 import-linterは[責務境界](architecture-boundaries.md)の静的import規則を確認します。
 これらは実行時の最小権限や永続化の正しさを保証しません。
 機能を追加するときは[段階計画](development-plan.md)の受入条件をテストへ具体化します。
