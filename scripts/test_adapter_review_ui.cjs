@@ -26,18 +26,19 @@ const assert = require('node:assert/strict');
     const login = async actor => {
       const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
       page.on('pageerror', error => errors.push(error.message));
-      await page.goto(base);
+      await page.goto(`${base}/#services/demo-checkout/settings`);
       await page.getByLabel('アクセストークン', { exact: true }).fill(token(actor));
       await page.getByRole('button', { name: 'ワークスペースに接続' }).click();
       await page.locator('#auth-dialog').waitFor({ state: 'hidden' });
-      await page.locator('a[data-view="adapters"]').click();
+      await page.locator('a[data-view="settings"]').click();
       return page;
     };
     const operator = await login('operator');
-    await operator.getByRole('button', { name: '＋ 変換定義を作成' }).click();
     const id = `ui-review-${Date.now()}`;
     await request('/sources', { id, service_id: 'demo-checkout', name: id, kind: 'push' });
     await request(`/sources/${id}/ingest`, { events: [{ external_id: id, payload: JSON.stringify({ message: 'Synthetic failure' }) }] });
+    await operator.locator('#refresh-button').click();
+    await operator.getByRole('button', { name: '解析ルールを作成', exact: true }).click();
     const draft = {
       id, name: id, source_id: id, target_instance_id: 'demo-checkout-v1',
       target_version: 1, version: 1, fields: { message: 'message' },

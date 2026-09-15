@@ -5,13 +5,6 @@ const $ = (selector) => document.querySelector(selector);
 const storeKey = "opsyne.access-token";
 const state = { token: "", session: null, data: null, view: "overview", refreshBusy: false, caseId: null, query: "", filter: "all", modalEpoch: 0, caseLive: null, renderedData: "" };
 try { state.token = sessionStorage.getItem(storeKey) || ""; } catch { /* In-memory sessions work when browser storage is unavailable. */ }
-const headings = {
-  overview: ["概要", "OPERATIONS OVERVIEW", "運用の現在地", "観測の状態と対応の進捗を、一つの場所で。"],
-  cases: ["案件", "CASE MANAGEMENT", "根拠から、次の判断へ。", "調査・提案・承認・実行・結果確認を案件ごとに追跡します。"],
-  sources: ["観測源", "OBSERVABILITY", "観測をつなぐ", "登録された対象と、収集の完全性を確認します。"],
-  adapters: ["変換定義", "NORMALIZATION", "原本に、意味を結び付ける。", "適用範囲と版を固定した変換定義を管理します。"],
-  audit: ["監査ログ", "AUDIT TRAIL", "判断と操作の記録", "誰が、何に、どのような操作を行ったかを確認します。"],
-};
 const statuses = {
   OPEN: ["未着手", "blue"], INVESTIGATING: ["調査中", "blue"], ANALYZED: ["調査済み", "blue"],
   PROPOSED: ["提案済み", "purple"], AWAITING_APPROVAL: ["承認待ち", "amber"], DRAFT: ["承認待ち", "amber"],
@@ -78,12 +71,6 @@ function relativeNode(value, className = "") {
   if (value !== null && value !== undefined) node.dataset.relativeTimestamp = typeof value === "number" ? String(value) : String(Date.parse(value) / 1000);
   return node;
 }
-function dataSignature() {
-  if (!state.data) return "";
-  const { worker, ...records } = state.data;
-  return JSON.stringify(records);
-}
-function rows(key) { return Array.isArray(state.data?.[key]) ? state.data[key] : []; }
 function serviceName(id) { return rows("services").find((item) => item.id === id)?.name || id || "対象未登録"; }
 function sourceName(id) { return rows("sources").find((item) => item.id === id)?.name || id || "観測源不明"; }
 function can(operation) {
@@ -101,6 +88,7 @@ function errorText(detail) {
   return detail ? JSON.stringify(detail) : "応答に詳細がありません。監査ログとサーバーの状態を確認してください。";
 }
 async function api(path, body, token = state.token, method = body === undefined ? "GET" : "POST") {
+  const epoch = state.routeEpoch;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 70000);
   try {
@@ -112,6 +100,7 @@ async function api(path, body, token = state.token, method = body === undefined 
     });
     let result;
     try { result = await response.json(); } catch { result = null; }
+    if (epoch !== state.routeEpoch) throw new Error("表示対象が変わったため、この応答の反映を中止しました。");
     if (!response.ok) {
       if (response.status === 401 && state.session) disconnect("認証の有効性を確認できません。トークンを確認して再接続してください。");
       const failure = new Error(`${response.status === 403 ? "この操作の権限がありません。" : ""}${errorText(result?.detail || result?.error || (response.status === 401 ? "トークンが正しいか確認してください。" : null))}`);
@@ -133,9 +122,10 @@ function toast(text, error = false) {
   toastTimer = setTimeout(() => { $("#toast").hidden = true; }, error ? 10000 : 5500);
 }
 async function busy(node, action) {
-  if (node.disabled) return;
+  if (node.disabled || !node.isConnected) return;
+  const epoch = state.routeEpoch;
   node.disabled = true; node.setAttribute("aria-busy", "true");
-  try { await action(); } catch (error) { toast(error.message, true); }
+  try { await action(); } catch (error) { if (epoch === state.routeEpoch) toast(error.message, true); }
   finally { node.disabled = false; node.removeAttribute("aria-busy"); node.dispatchEvent(new Event("opsyne:idle")); }
 }
 function setConnection(connected) {
@@ -145,11 +135,12 @@ function setConnection(connected) {
 }
 function disconnect(reason) {
   state.token = ""; state.session = null; state.data = null;
+  state.routeEpoch += 1; state.requestId += 1; state.refreshBusy = false; state.summaries = {}; state.workspace = {}; state.caseServices.clear();
+  $("#service-context").dataset.signature = ""; updateHeadings();
   try { sessionStorage.removeItem(storeKey); } catch { /* Session memory was cleared above. */ }
   $("#identity").replaceChildren(document.createTextNode("未接続"), el("small", "", "アクセストークンで接続"));
   $("#page-content").replaceChildren(empty("接続が必要です", "アクセストークンでワークスペースに接続してください。", "◎"));
   $("#heading-actions").replaceChildren();
-  $("#case-count").textContent = "";
   $("#global-error").hidden = true;
   $("#action-dialog").close();
   state.modalEpoch += 1;
@@ -167,62 +158,6 @@ async function connect(token) {
   $("#auth-dialog").close(); $("#auth-token").value = "";
   await refresh(true);
 }
-async function refresh(force = false) {
-  if (!state.session || state.refreshBusy) return;
-  state.refreshBusy = true;
-  try {
-    const overview = await api("/overview");
-    if (!overview || ["services", "sources", "cases", "plans", "executions", "adapters", "audit", "coverage", "tasks"].some((key) => !Array.isArray(overview[key]))) throw new Error("状態データの形式を確認できません。未確認のデータを正常として表示しないため、最後に取得できた状態を保持しています。");
-    state.data = overview;
-    $("#global-error").hidden = true;
-    setConnection(true);
-    $("#last-updated").textContent = `最終取得 ${date(Date.now() / 1000, true)}`;
-    $("#case-count").textContent = rows("cases").filter((item) => !["RESOLVED", "CLOSED"].includes(item.status)).length || "";
-    const focused = document.activeElement;
-    const editing = focused && ["INPUT", "TEXTAREA", "SELECT", "BUTTON", "SUMMARY", "A"].includes(focused.tagName) && $("#page-content").contains(focused);
-    if (force || (!editing && !$("#action-dialog").open && dataSignature() !== state.renderedData)) render();
-    document.querySelectorAll("[data-relative-timestamp]").forEach((node) => { node.textContent = relative(Number(node.dataset.relativeTimestamp)); });
-    if (state.caseLive && $("#action-dialog").open) await refreshCaseSignals();
-  } catch (error) {
-    setConnection(false);
-    $("#global-error").textContent = error.message;
-    $("#global-error").hidden = false;
-    if (!state.data && state.session) $("#page-content").replaceChildren(empty("データを取得できませんでした", "サーバーの状態を確認し、右上の「更新」を押してください。", "↻"));
-  } finally { state.refreshBusy = false; }
-}
-function navigate() {
-  const requested = location.hash.slice(1) || "overview";
-  state.view = headings[requested] ? requested : "overview";
-  state.query = ""; state.filter = "all";
-  if (state.data) render();
-  updateHeadings();
-}
-function updateHeadings() {
-  const [breadcrumb, eyebrow, title, description] = headings[state.view];
-  $("#breadcrumb-title").textContent = breadcrumb;
-  $("#page-eyebrow").textContent = eyebrow; $("#page-title").textContent = title; $("#page-description").textContent = description;
-  document.title = `${breadcrumb} — OpSyne`;
-  document.querySelectorAll("[data-view]").forEach((link) => {
-    const active = link.dataset.view === state.view;
-    link.classList.toggle("active", active);
-    if (active) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current");
-  });
-}
-function render() {
-  state.renderedData = dataSignature();
-  updateHeadings();
-  const actions = $("#heading-actions"); actions.replaceChildren();
-  if (state.view === "overview" || state.view === "sources") {
-    append(actions, button("↻  収集・解析", (event) => busy(event.currentTarget, async () => {
-      const result = await api("/poll", {}); toast("収集・解析の処理が完了しました。"); await refresh(true);
-      if (result?.errors?.length) toast(errorText(result.errors), true);
-    }), "button", can("operate")), button("＋ 観測源を登録", sourceForm, "button primary", can("configure")));
-  }
-  if (state.view === "adapters") append(actions, button("＋ 変換定義を作成", adapterForm, "button primary", can("configure") || can("operate")));
-  if (state.view === "cases") append(actions, button("↻  最新の状態を取得", () => refresh(true)));
-  const views = { overview: renderOverview, cases: renderCases, sources: renderSources, adapters: renderAdapters, audit: renderAudit };
-  $("#page-content").replaceChildren(views[state.view]());
-}
 function empty(title, description, symbol = "◫", action = null) {
   return append(el("div", "empty-state"), el("span", "empty-icon", symbol), el("h3", "", title), el("p", "", description), action);
 }
@@ -237,23 +172,6 @@ function panel(title, subtitle = "", count = null, action = null) {
 function info(items) {
   const grid = el("dl", "info-grid");
   for (const [key, value] of items) append(grid, append(el("div", "info-item"), el("dt", "", key), value instanceof Node ? append(el("dd"), value) : el("dd", "", value ?? "未設定")));
-  return grid;
-}
-function metrics() {
-  const active = rows("cases").filter((item) => !["RESOLVED", "CLOSED"].includes(item.status));
-  const pending = rows("plans").filter((item) => item.status === "DRAFT");
-  const uncertain = rows("sources").filter((source) => !["healthy", "disabled"].includes(rows("coverage").find((item) => item.source_id === source.id)?.status));
-  const unknown = rows("executions").filter((item) => item.status === "UNKNOWN");
-  const cards = [
-    ["進行中の案件", active.length, "▤", "調査から結果確認まで", ""],
-    ["承認待ちの計画", pending.length, "◇", "固定された計画への判断が必要", "warn"],
-    ["観測状態の要確認", uncertain.length, "◎", `${rows("sources").length} 観測源を登録済み`, "warn"],
-    ["操作結果不明", unknown.length, "⇄", "照合が完了するまで再送を保留", "danger"],
-  ];
-  const grid = el("div", "metrics-grid");
-  for (const [label, value, icon, description, color] of cards) {
-    append(grid, append(el("div", "metric-card"), append(el("div", "metric-top"), el("span", "", label), el("span", "metric-icon", icon)), el("div", `metric-number ${value ? color : ""}`, value), el("div", "metric-description", description)));
-  }
   return grid;
 }
 function caseTable(cases) {
@@ -273,60 +191,6 @@ function caseTable(cases) {
   }
   table.append(body); return append(el("div", "table-scroll"), table);
 }
-function renderCoverage() {
-  const root = panel("観測の完全性", "対象の正常性とは独立して評価", null, button("観測源へ →", () => { location.hash = "sources"; }, "inline-link"));
-  const body = el("div", "panel-body");
-  const healthy = rows("coverage").filter((item) => item.status === "healthy").length;
-  const count = rows("sources").length;
-  const summary = append(el("div", "coverage-summary"), el("span", "ring", "◎"), append(el("div"), el("strong", "", count ? `${healthy} / ${count} 観測源が受信継続` : "観測源は未登録です"), el("p", "", "最終受信・解析失敗・欠落を個別に確認")));
-  body.append(summary);
-  for (const source of rows("sources").slice(0, 4)) {
-    const coverage = rows("coverage").find((item) => item.source_id === source.id);
-    const row = el("div", "coverage-row");
-    append(row, append(el("div", "coverage-row-head"), el("span", "coverage-row-name", source.name), badge(coverage?.status || "missing")), append(el("div", "coverage-row-meta"), el("span", "", source.kind === "file" ? "FILE COLLECTOR" : "PUSH INGESTION"), relativeNode(coverage?.last_received)));
-    body.append(row);
-  }
-  append(root, body, el("div", "section-note", "未受信や解析不能のデータを正常として扱いません。"));
-  return root;
-}
-function renderOverview() {
-  const root = el("div");
-  const recovery = state.data?.recovery;
-  if (can("configure") && (recovery?.quarantined || recovery?.holds?.length)) {
-    const notice = panel("復元・実行保留の確認", recovery.quarantined ? "復元後の照合が完了するまで、新しい実行許可を保留しています" : "記録された実行予約と台帳の状態を確認できます", null, button("管理者として確認", recoveryDetails, "button small"));
-    notice.append(el("div", "section-note", `復元後の確認待ち: ${recovery.quarantined ? "あり" : "なし"} · 実行予約: ${recovery.holds?.length || 0} 件`)); root.append(notice);
-  }
-  root.append(metrics());
-  const primary = el("div", "overview-primary");
-  const recent = [...rows("cases")].sort((a, b) => (b.updated_at || b.created_at) - (a.updated_at || a.created_at)).slice(0, 6);
-  const cases = panel("対応する案件", "根拠を確認し、次のアクションへ", rows("cases").length, button("すべて見る →", () => { location.hash = "cases"; }, "inline-link"));
-  cases.append(caseTable(recent)); primary.append(cases);
-  const activity = panel("最近のアクティビティ", "判断と操作は監査ログに記録されます", null, button("監査ログへ →", () => { location.hash = "audit"; }, "inline-link"));
-  activity.append(activityList(rows("audit").slice(0, 4))); primary.append(activity);
-  const secondary = el("div", "overview-secondary"); secondary.append(renderCoverage());
-  const workflow = el("section", "workflow-card");
-  append(workflow, el("div", "eyebrow", "HUMAN GOVERNED OPERATIONS"), el("h3", "", "判断の根拠を、最後まで。"), el("p", "", "提案と認可、操作と結果確認を分離。承認した計画を現在の条件で照合し、実行後の状態を独立して確かめます。"));
-  const steps = el("div", "workflow-steps");
-  ["観測", "調査", "承認", "実行", "確認"].forEach((label, index) => { if (index) steps.append(el("b", "", "→")); steps.append(el("span", "", label)); });
-    workflow.append(steps); secondary.append(workflow);
-  const llm = state.data?.llm;
-  if (llm) {
-    const llmPanel = panel("調査・変換提案モデル", "収集処理はモデルの稼働に依存しません");
-    const llmBody = el("div", "panel-body");
-    append(llmBody, info([["モデル", llm.model || "未設定"], ["日次呼び出し上限", llm.daily_call_limit ?? "未設定"]]), llm.configured ? badge("ACTIVE") : el("span", "badge outline", "未設定"));
-    llmBody.append(info([["未知形式の自動提案", autoAdapterStatus()]]));
-    llmBody.append(el("p", "field-hint", "未知形式をまとめて変換案を作成します。有効化には内容の確認と承認が必要です。"));
-    if (!llm.configured) llmBody.append(el("p", "field-hint", "API キーが未設定です。サーバー環境に OPENAI_API_KEY を設定すると、調査・変換案の生成を利用できます。"));
-    llmPanel.append(llmBody); secondary.append(llmPanel);
-  }
-  if (!rows("services").length) {
-    const start = panel("はじめの一歩", "対象を登録して、観測を開始");
-    const body = el("div", "panel-body");
-    append(body, button("＋ サービスを登録", serviceForm, "button full-width", can("configure")), button("合成データで動作を確認", demoForm, "button subtle full-width", can("configure")), el("p", "field-hint", "デモは明示的に追加する合成データです。"));
-    start.append(body); secondary.append(start);
-  }
-  root.append(append(el("div", "overview-grid"), primary, secondary)); return root;
-}
 function toolbar(placeholder, filters, onChange) {
   const bar = el("div", "toolbar");
   const search = el("input", "search-input"); search.type = "search"; search.placeholder = placeholder; search.value = state.query; search.setAttribute("aria-label", placeholder);
@@ -339,21 +203,12 @@ function toolbar(placeholder, filters, onChange) {
   }
   return bar;
 }
-function renderCases() {
-  const root = el("div"); const target = el("div");
-  const update = () => {
-    const query = state.query.toLocaleLowerCase();
-    const matches = rows("cases").filter((item) => `${item.title} ${item.id} ${serviceName(item.service_id)}`.toLocaleLowerCase().includes(query) && (state.filter === "all" || (state.filter === "open" ? !["RESOLVED", "CLOSED"].includes(item.status) : ["RESOLVED", "CLOSED"].includes(item.status))));
-    const list = panel("案件一覧", "原本・調査結果・固定計画・実行台帳を確認", matches.length); list.append(caseTable(matches)); target.replaceChildren(list);
-  };
-  append(root, toolbar("案件名・サービス・IDで検索", [["all", "すべての状態"], ["open", "進行中"], ["resolved", "解決・終了"]], update), target); update(); return root;
-}
-function renderSources() {
+function renderSources(settingsOnly = false) {
   const root = el("div");
   const heading = append(el("div", "list-section-heading"), el("h2", "", `サービス (${rows("services").length})`), button("＋ サービスを登録", serviceForm, "button small", can("configure")));
-  root.append(heading);
-  if (!rows("services").length) root.append(append(el("div", "panel"), empty("サービスを登録してください", "監視対象の実体・版・所有者を先に登録します。その後、観測源を関連付けます。", "◎")));
-  else {
+  if (!settingsOnly) root.append(heading);
+  if (!settingsOnly && !rows("services").length) root.append(append(el("div", "panel"), empty("サービスを登録してください", "監視対象の実体・版・所有者を先に登録します。その後、観測源を関連付けます。", "◎")));
+  else if (!settingsOnly) {
     const grid = el("div", "source-grid");
     for (const service of rows("services")) {
       const card = el("article", "source-card");
@@ -382,7 +237,7 @@ function renderSources() {
     root.append(grid);
   }
   const demo = append(el("div", "panel"), append(el("div", "panel-header"), append(el("div"), el("h3", "", "合成データで確認"), el("p", "panel-subtitle", "隔離されたデモ対象と観測イベントを追加します。")), button("デモを準備", demoForm, "button small", can("configure"))));
-  root.append(demo); return root;
+  if (!settingsOnly) root.append(demo); return root;
 }
 function renderAdapters() {
   const root = el("div");
@@ -446,33 +301,6 @@ function activityList(entries) {
   for (const entry of entries) append(list, append(el("div", "activity-item"), el("span", "activity-dot", "↗"), append(el("div", "activity-text"), el("div", "", auditAction(entry)), el("div", "activity-meta", `${entry.actor || "system"} · ${entry.target_id || entry.object_id || entry.resource_id || "workspace"}`)), relativeNode(entry.created_at || entry.at || entry.timestamp, "activity-time")));
   return list;
 }
-function renderAudit() {
-  const root = el("div"); const target = el("div");
-  const update = () => {
-    const query = state.query.toLocaleLowerCase();
-    const entries = rows("audit").filter((item) => JSON.stringify(item).toLocaleLowerCase().includes(query));
-    const box = panel("監査ログ", "時刻はブラウザーのタイムゾーンで表示", entries.length);
-    if (!entries.length) box.append(empty("該当する記録はありません", "登録・調査・承認・実行の履歴がここに表示されます。", "≡"));
-    else {
-      const table = el("table", "data-table"); const head = el("tr");
-      ["日時", "実行主体", "操作", "対象", "詳細"].forEach((name) => { const th = el("th", "", name); th.scope = "col"; head.append(th); });
-      table.append(append(el("thead"), head)); const body = el("tbody");
-      for (const entry of entries) append(body, append(el("tr"), el("td", "muted", date(entry.created_at || entry.at || entry.timestamp)), el("td", "", entry.actor || "system"), el("td", "", auditAction(entry)), el("td", "audit-object", entry.target_id || entry.object_id || entry.resource_id || "—"), append(el("td"), button("詳細", () => {
-        const content = openDialog("監査記録", "AUDIT RECORD"); content.append(jsonDetails("記録された内容", entry, true));
-      }, "inline-link"))));
-      table.append(body); box.append(append(el("div", "table-scroll"), table));
-    }
-    target.replaceChildren(box);
-  };
-  append(root, toolbar("主体・操作・対象で検索", null, update), target); update();
-  if (rows("tasks").length) {
-    const tasks = panel("調査タスク", "有限の処理単位として保持された調査の記録", rows("tasks").length);
-    const body = el("div", "panel-body");
-    for (const task of rows("tasks").slice(0, 20)) body.append(jsonDetails(`${taskRoleNames[task.role] || task.role} · ${task.id} · ${task.status || "未確認"}`, task));
-    tasks.append(body); root.append(tasks);
-  }
-  return root;
-}
 function openDialog(title, eyebrow = "WORKSPACE", wide = false) {
   state.modalEpoch += 1;
   state.caseLive = null;
@@ -506,8 +334,9 @@ function createForm(body, submitText, handler) {
   const submit = el("button", "button primary", submitText); submit.type = "submit";
   const actions = append(el("div", "form-actions"), button("キャンセル", () => $("#action-dialog").close()), submit);
   append(form, fields, error, actions); body.append(form);
+  const epoch = state.modalEpoch;
   form.addEventListener("submit", async (event) => {
-    event.preventDefault(); if (submit.disabled) return; submit.disabled = true; submit.setAttribute("aria-busy", "true"); error.hidden = true;
+    event.preventDefault(); if (submit.disabled || epoch !== state.modalEpoch || !form.isConnected) return; submit.disabled = true; submit.setAttribute("aria-busy", "true"); error.hidden = true;
     try { await handler(new FormData(form)); }
     catch (failure) { error.textContent = failure.message; error.hidden = false; }
     finally { submit.disabled = false; submit.removeAttribute("aria-busy"); submit.dispatchEvent(new Event("opsyne:idle")); }
@@ -519,7 +348,7 @@ function serviceForm() {
   const body = openDialog("サービスを登録", "REGISTER SERVICE");
   const { fields } = createForm(body, "サービスを登録", async (form) => {
     const payload = Object.fromEntries(form); payload.version = Number(payload.version); payload.enabled = true;
-    await api("/services", payload); $("#action-dialog").close(); toast("サービスを登録しました。"); await refresh(true);
+    await api("/services", payload); $("#action-dialog").close(); toast("サービスを登録しました。"); location.hash = serviceUrl("home", payload.id);
   });
   formField(fields, "サービス ID", "id", identifierOptions()); formField(fields, "サービス名", "name");
   formField(fields, "対象実体 ID", "instance_id", identifierOptions()); formField(fields, "所有者", "owner", { value: state.session.actor });
@@ -626,6 +455,7 @@ function demoForm() {
   });
 }
 async function integrationDetails(service) {
+  if (service.id !== state.route.serviceId) return;
   const body = openDialog(`${service.name} の接続設定`, "SERVICE CAPABILITIES");
   const epoch = state.modalEpoch;
   append(body, message("実行する HTTP 操作と、独立した読取確認を別々に登録します。対象と操作は設定に固定され、計画の承認・認可を経て実行されます。"));
@@ -740,6 +570,7 @@ function adapterForm() {
     let payload;
     try { payload = JSON.parse(form.get("definition")); } catch { throw new Error("JSON の構文に誤りがあります。括弧・カンマ・引用符を確認してください。"); }
     payload.explanation = readExplanation(form);
+    if (!rows("sources").some(source => source.id === payload.source_id)) throw new Error("選択中のサービスのログ接続を指定してください。");
     await api("/adapters", payload); $("#action-dialog").close(); toast("変換定義を保存しました。別の主体による確認と承認が必要です。"); await refresh(true);
   });
   const editor = formField(fields, "宣言的な変換定義（JSON）", "definition", { type: "textarea", value: JSON.stringify(definition, null, 2), full: true }); editor.classList.add("json-input"); editor.spellcheck = false;
@@ -795,6 +626,7 @@ function editAdapterExplanation(record) {
   explanationFields(fields, record.explanation?.human);
 }
 async function openAdapter(record) {
+  if (!rows("sources").some(source => source.id === adapterObject(record).source_id)) return;
   const body = openDialog("変換定義を取得中", "REVIEW ADAPTER");
   const epoch = state.modalEpoch;
   body.append(el("p", "analysis-text", "最新の定義と説明を取得しています…"));
@@ -859,12 +691,20 @@ function renderAdapterReview(record) {
   body.append(actions);
 }
 async function openCase(id) {
+  if (!state.route.serviceId) return;
+  const knownService = state.caseServices.get(id);
+  if (knownService && knownService !== state.route.serviceId && state.route.caseId !== id) return;
+  if (state.route.caseId !== id) { location.hash = serviceUrl("incidents", state.route.serviceId, id); return; }
   state.caseId = id;
   const body = openDialog("案件を読み込み中…", "CASE WORKSPACE", true); const epoch = state.modalEpoch;
   body.append(append(el("div", "loading-card"), el("span", "spinner"), el("p", "", "根拠と対応状況を取得しています…")));
   try {
     const detail = await api(`/cases/${safeId(id)}`);
     if (epoch !== state.modalEpoch || !$("#action-dialog").open) return;
+    if (detail?.case?.service_id !== state.route.serviceId || detail.case.id !== id) {
+      body.replaceChildren(message("このインシデントは選択中のサービスに属していません。URLを確認してください。", "warning")); return;
+    }
+    state.caseServices.set(id, detail.case.service_id);
     renderCaseDetail(body, detail);
   } catch (error) { if (epoch === state.modalEpoch) body.replaceChildren(message(error.message, "error")); }
 }
@@ -910,6 +750,18 @@ function renderCaseDetail(body, detail) {
   const executionSection = section(`実行台帳と独立確認 (${executions.length})`);
   if (!executions.length) executionSection.append(el("p", "analysis-text", "実行記録はありません。操作の前に意図を永続化し、結果不明は照合まで保留します。"));
   for (const execution of executions) executionSection.append(executionCard(execution, item)); body.append(executionSection);
+  const detailTabs = el("div", "detail-actions incident-sections"); detailTabs.setAttribute("aria-label", "インシデント詳細の表示");
+  const groups = { summary: [planSection], evidence: [liveDiscovery, liveTasks, liveAnalysis, liveAdapterAnalysis, evidenceSection], timeline: [executionSection] };
+  const buttons = [];
+  const show = selected => {
+    state.detailSection = selected;
+    for (const [name, nodes] of Object.entries(groups)) for (const node of nodes) node.hidden = name !== selected;
+    for (const node of buttons) node.setAttribute("aria-pressed", String(node.dataset.section === selected));
+  };
+  for (const [name, title] of [["summary", "概要と対応案"], ["evidence", "ログと調査"], ["timeline", "対応履歴・復旧確認"]]) {
+    const node = button(title, () => show(name)); node.dataset.section = name; buttons.push(node); detailTabs.append(node);
+  }
+  body.insertBefore(detailTabs, liveDiscovery); show(state.detailSection || "summary");
   state.caseLive = { id: item.id, epoch: state.modalEpoch, analysis: liveAnalysis, analysisValue: JSON.stringify(analysis), adapterAnalysis: liveAdapterAnalysis, adapterAnalysisValue: JSON.stringify([detail.adapter_analysis, analysis?.task_id]), tasks: liveTasks, tasksValue: JSON.stringify(rows("tasks")), status: statusNode, discovery: liveDiscovery, discoveryValue: JSON.stringify(detail.adapter_discovery), proposalButton };
 }
 function latestTask(caseId) {
@@ -922,6 +774,7 @@ async function refreshCaseSignals() {
   const live = state.caseLive;
   const detail = await api(`/cases/${safeId(live.id)}`);
   if (live !== state.caseLive || live.epoch !== state.modalEpoch) return;
+  if (detail?.case?.service_id !== state.route.serviceId || detail.case.id !== live.id) throw new Error("インシデントの所属を確認できません。");
   const status = badge(detail.case.status); live.status.className = status.className; live.status.textContent = status.textContent;
   const analysis = detail.analysis || detail.case.analysis;
   const serialized = JSON.stringify(analysis);
@@ -993,6 +846,7 @@ async function planForm(item) {
   } catch (error) { if (state.modalEpoch === epoch) body.append(message(error.message, "error")); }
 }
 function reviewPlan(record, item, execute = false) {
+  if (planObject(record).service_id !== state.route.serviceId) return;
   const plan = planObject(record); const status = record.status || "DRAFT";
   const runRecovery = execute || can("operate") && can("approve");
   const body = openDialog(execute ? "復旧処理を開始" : "復旧計画を確認", "PLAN REVIEW", true);
@@ -1134,11 +988,10 @@ $("#session-button").addEventListener("click", () => {
   append(body, info([["主体", state.session.actor], ["役割", roleNames[state.session.role] || state.session.role]]), message("承認には提案者と異なる主体が必要です。接続を切り替えると現在のトークンはこのタブから削除されます。"), append(el("div", "form-actions"), button("切断して別の主体で接続", () => disconnect(), "button")));
 });
 $("#refresh-button").addEventListener("click", (event) => busy(event.currentTarget, () => refresh(true)));
-$("#dialog-close").addEventListener("click", () => $("#action-dialog").close());
+function closeActionDialog() {
+  $("#action-dialog").close();
+  if (state.route.caseId) location.hash = serviceUrl("incidents");
+}
+$("#dialog-close").addEventListener("click", closeActionDialog);
+$("#action-dialog").addEventListener("cancel", event => { event.preventDefault(); closeActionDialog(); });
 $("#action-dialog").addEventListener("close", () => { state.modalEpoch += 1; });
-window.addEventListener("hashchange", navigate);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
-setInterval(() => { if (!document.hidden) refresh(); }, 10000);
-navigate();
-if (state.token) connect(state.token).catch(() => disconnect("保存したトークンでは接続できませんでした。再接続してください。"));
-else disconnect();

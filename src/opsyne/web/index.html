@@ -7,24 +7,18 @@
     <title>OpSyne — Operations Console</title>
     <link rel="stylesheet" href="/static/styles.css">
     <script defer src="/static/app.js"></script>
+    <script defer src="/static/service-navigation.js"></script>
   </head>
   <body>
     <a class="skip-link" href="#main">メインコンテンツへ</a>
     <div class="app-shell">
       <aside class="sidebar" aria-label="メインナビゲーション">
-        <a href="#overview" class="brand" aria-label="OpSyne ホーム">
+        <a href="#services" class="brand" aria-label="OpSyne サービス一覧">
           <span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i></span>
           <span>OpSyne<span class="brand-caption">OPERATIONS INTELLIGENCE</span></span>
         </a>
-        <div class="workspace-label"><span class="workspace-icon" aria-hidden="true">O</span><span>Operations workspace<small>Local environment</small></span></div>
-        <span class="nav-label">WORKSPACE</span>
-        <nav class="nav-list">
-          <a href="#overview" data-view="overview"><span class="nav-icon" aria-hidden="true">◫</span>概要<span class="nav-count" id="overview-count"></span></a>
-          <a href="#cases" data-view="cases"><span class="nav-icon" aria-hidden="true">▤</span>案件<span class="nav-count" id="case-count"></span></a>
-          <a href="#sources" data-view="sources"><span class="nav-icon" aria-hidden="true">◎</span>観測源</a>
-          <a href="#adapters" data-view="adapters"><span class="nav-icon" aria-hidden="true">⇄</span>変換定義</a>
-          <a href="#audit" data-view="audit"><span class="nav-icon" aria-hidden="true">≡</span>監査ログ</a>
-        </nav>
+        <div id="service-context" class="service-context"></div>
+        <nav class="nav-list" aria-label="選択したサービスのメニュー"></nav>
         <div class="sidebar-note"><span class="eyebrow">CONTROL BY DESIGN</span><p>観測から対応、<br>独立した結果確認まで。</p><div class="mini-flow" aria-hidden="true"><i></i><b></b><i></i><b></b><i></i><b></b><i></i></div></div>
         <div class="sidebar-footer"><span class="avatar" aria-hidden="true">OP</span><span id="identity">未接続<small>アクセストークンで接続</small></span><button class="icon-button light" id="session-button" type="button" aria-label="接続設定" title="接続設定">↗</button></div>
       </aside>

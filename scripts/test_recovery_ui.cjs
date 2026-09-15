@@ -36,13 +36,13 @@ const { randomUUID } = require('node:crypto');
       page.on('pageerror', error => errors.push(error.message));
       const writes = [];
       page.on('request', req => { if (req.method() === 'POST') writes.push(new URL(req.url()).pathname); });
-      await page.goto(base);
+      await page.goto(`${base}/#services/demo-checkout/incidents`);
       await page.getByLabel('アクセストークン', { exact: true }).fill(token(actor));
       await page.getByRole('button', { name: 'ワークスペースに接続' }).click();
       await expect(page.locator('#auth-dialog')).not.toBeVisible();
       const open = async (execute = false) => {
         if (await page.locator('#action-dialog').isVisible()) await page.locator('#dialog-close').click();
-        await page.locator('a[data-view="cases"]').click();
+        await page.locator('a[data-view="incidents"]').click();
         await page.getByRole('button', { name: 'サンプル: 注文処理を復旧してください', exact: true }).click();
         const card = page.locator('article.plan-card').filter({ has: page.getByText(reason, { exact: true }) });
         await card.getByRole('button', { name: execute ? '復旧処理を開始' : '固定計画を確認', exact: true }).click();

@@ -31,3 +31,29 @@
 .recovery-footer .button{white-space:normal;min-height:40px}
 .recovery-footer [hidden]{display:none!important}
 @media(max-width:700px){.recovery-footer{padding:12px 20px}.recovery-footer .form-actions{gap:8px}}
+
+/* The selected service remains visible above the same five navigation entries. */
+.service-context{margin:28px 0 18px;min-width:0}
+.service-context a{color:#a9dddd;display:block;margin-bottom:16px}
+.service-context label{color:#b5c3d4;margin-top:12px}
+.service-context select{font-size:12px;min-width:0;max-width:100%}
+.service-context:empty{display:none}
+.collection-status{font-size:11px;color:#63748a;margin-bottom:15px}
+.service-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+.incident-sections{margin-top:22px}.incident-sections [aria-pressed=true]{background:#e3f3f3;color:#076c72;border-color:#087f86}
+[hidden]{display:none!important}
+.shared-settings{display:flex;gap:16px;flex-wrap:wrap;margin:16px 0 22px}
+.shared-settings p{width:100%}
+.source-card h2,.page-heading,.breadcrumb,.service-context{overflow-wrap:anywhere}
+.sidebar{overflow-y:auto}
+@media(max-width:700px){
+  .sidebar{position:relative;overflow:visible}
+  .service-context{margin:18px 0 8px}
+  .service-context a{margin-bottom:8px}
+  .service-context label{margin-top:6px}
+  .nav-list{overflow-x:auto;justify-content:flex-start;padding-bottom:3px}
+  .nav-list a{flex:0 0 auto;min-height:44px;padding:10px}
+  .topbar{height:auto;min-height:49px;flex-wrap:wrap;padding-top:10px;padding-bottom:10px}
+  .page-heading{flex-wrap:wrap}
+  .heading-actions{max-width:none}
+}
