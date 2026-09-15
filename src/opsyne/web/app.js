@@ -477,6 +477,7 @@ function openDialog(title, eyebrow = "WORKSPACE", wide = false) {
   state.modalEpoch += 1;
   state.caseLive = null;
   const dialog = $("#action-dialog"); dialog.classList.toggle("wide", wide);
+  dialog.classList.remove("recovery-review"); dialog.querySelector(".recovery-footer")?.remove();
   $("#dialog-title").textContent = title; $("#dialog-eyebrow").textContent = eyebrow;
   const content = $("#dialog-content"); content.replaceChildren();
   if (!dialog.open) dialog.showModal();
@@ -929,6 +930,7 @@ function reviewPlan(record, item, execute = false) {
   const plan = planObject(record); const status = record.status || "DRAFT";
   const runRecovery = execute || can("operate") && can("approve");
   const body = openDialog(execute ? "復旧処理を開始" : "復旧計画を確認", "PLAN REVIEW", true);
+  $("#action-dialog").classList.add("recovery-review");
   const epoch = state.modalEpoch;
   const session = state.session; const token = state.token;
   const isCurrent = () => state.modalEpoch === epoch && $("#action-dialog").open && state.session === session && state.token === token;
@@ -959,8 +961,9 @@ function reviewPlan(record, item, execute = false) {
   if (runRecovery) body.append(message("確認した操作を実行し、その後にサービスの正常性を確認します。対象や設定の変更、期限切れ、実行条件の不一致があれば停止します。処理が終わるまでこの画面を開いたままにしてください。"));
   else if (status === "DRAFT" && can("approve")) body.append(message("この役割では承認まで行えます。承認後、実行権限のある担当者が復旧処理を開始してください。"));
   if (status === "DRAFT" || (execute && status === "APPROVED")) {
+    const footer = el("div", "recovery-footer");
     const confirm = el("label", "check-line"); const checkbox = el("input"); checkbox.type = "checkbox";
-    append(confirm, checkbox, document.createTextNode(execute ? "対象・操作・影響・確認条件を確認しました。復旧処理を開始します。" : runRecovery ? "対象・操作・影響・成功条件・中止条件・期限を確認しました。この計画を承認し、復旧処理を開始します。" : "対象・版・根拠・影響・成功条件・中止条件・期限を確認しました。この固定計画を承認します。")); body.append(confirm);
+    append(confirm, checkbox, document.createTextNode(execute ? "対象・操作・影響・確認条件を確認しました。復旧処理を開始します。" : runRecovery ? "対象・操作・影響・成功条件・中止条件・期限を確認しました。この計画を承認し、復旧処理を開始します。" : "対象・版・根拠・影響・成功条件・中止条件・期限を確認しました。この固定計画を承認します。")); footer.append(confirm);
     const allowed = !expired && Boolean(plan.digest) && (execute ? can("operate") : can("approve") && !isSelf);
     const progress = el("ol", "detail-list recovery-progress"); progress.hidden = true;
     const steps = [el("li", "", execute ? "承認：承認済み" : "承認：待機中"), el("li", "", "復旧処理：待機中"), el("li", "", "復旧確認：待機中")];
@@ -970,13 +973,13 @@ function reviewPlan(record, item, execute = false) {
     let attempted = false;
     const reject = !execute ? button("却下する", () => rejectForm(plan, item), "button danger", can("approve")) : null;
     if (reject) actions.append(reject);
-    const showFeedback = (text, type = "info") => { feedback.textContent = text; feedback.className = `message ${type}`; feedback.hidden = false; };
+    const showFeedback = (text, type = "info") => { feedback.textContent = text; feedback.className = `message ${type}`; feedback.hidden = false; feedback.scrollIntoView({ block: "nearest" }); };
     const records = button("案件と実行記録を確認", (event) => busy(event.currentTarget, async () => { await refresh(); if (isCurrent()) await openCase(item.id); }));
     records.hidden = true;
     const submit = button(execute ? "復旧を実行して確認" : runRecovery ? "承認して復旧を実行" : "この計画を承認", (event) => busy(event.currentTarget, async () => {
       if (attempted || !isCurrent()) return;
-      attempted = true; checkbox.disabled = true; if (reject) reject.disabled = true;
-      progress.hidden = false;
+      attempted = true; checkbox.disabled = true; confirm.hidden = true; if (reject) { reject.disabled = true; reject.hidden = true; }
+      progress.hidden = false; progress.scrollIntoView({ block: "nearest" });
       let phase = execute ? 1 : 0;
       try {
         if (!execute) {
@@ -1024,7 +1027,7 @@ function reviewPlan(record, item, execute = false) {
       submit.title = attempted ? "送信済みです。案件と実行記録を確認してください" : !allowed ? "役割・提案者・有効期限を確認してください" : !operationReady ? "操作能力の内容を取得しています" : !checkbox.checked ? "内容を確認してチェックを入れてください" : "";
     };
     updateApprovalState();
-    checkbox.addEventListener("change", updateApprovalState); submit.addEventListener("opsyne:idle", updateApprovalState); append(actions, submit, records); body.append(actions);
+    checkbox.addEventListener("change", updateApprovalState); submit.addEventListener("opsyne:idle", updateApprovalState); append(actions, submit, records); footer.append(actions); $("#action-dialog").append(footer);
   }
 }
 function rejectForm(plan, item) {

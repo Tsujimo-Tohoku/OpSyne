@@ -13,3 +13,14 @@
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}.spinner{animation:none}}
 
 .adapter-explanation .analysis-text,.adapter-explanation .field-hint{overflow-wrap:anywhere}
+
+/* Keep recovery consent and actions visible while the plan scrolls independently. */
+.action-dialog.recovery-review[open]{display:flex;flex-direction:column;max-height:calc(100dvh - 32px);overflow:hidden}
+.recovery-review .dialog-heading{flex-shrink:0;position:static}
+.recovery-review #dialog-content{min-height:0;overflow:auto;overscroll-behavior:contain}
+.recovery-footer{flex-shrink:0;padding:16px 27px;background:white;border-top:1px solid var(--border)}
+.recovery-footer .check-line{margin:0}
+.recovery-footer .form-actions{margin-top:12px;padding-top:0;border:0;flex-wrap:wrap}
+.recovery-footer .button{white-space:normal;min-height:40px}
+.recovery-footer [hidden]{display:none!important}
+@media(max-width:700px){.recovery-footer{padding:12px 20px}.recovery-footer .form-actions{gap:8px}}

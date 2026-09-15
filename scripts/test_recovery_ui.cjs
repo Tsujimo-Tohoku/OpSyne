@@ -48,7 +48,7 @@ const { randomUUID } = require('node:crypto');
         await card.getByRole('button', { name: execute ? '復旧処理を開始' : '固定計画を確認', exact: true }).click();
       };
       await open();
-      const confirm = () => page.locator('#dialog-content input[type=checkbox]').check();
+      const confirm = () => page.locator('#action-dialog input[type=checkbox]').check();
       const submit = page.getByRole('button', { name: '承認して復旧を実行', exact: true });
       const feedback = page.locator('#dialog-content [role=status]');
       const executionRequests = () => writes.filter(url => url.endsWith('/execute'));
@@ -180,6 +180,20 @@ const { randomUUID } = require('node:crypto');
     }
     {
       const test = await prepare();
+      for (const viewport of [{ width: 1280, height: 600 }, { width: 390, height: 600 }, { width: 700, height: 360 }]) {
+        await test.page.setViewportSize(viewport);
+        for (const scroll of [0, 100000]) {
+          await test.page.locator('#dialog-content').evaluate((node, top) => { node.scrollTop = top; }, scroll);
+          const box = await test.submit.boundingBox();
+          assert(box && box.y >= 0 && box.y + box.height <= viewport.height, 'Approval button must remain inside the viewport');
+          assert(box.x >= 0 && box.x + box.width <= viewport.width, 'Approval button must fit horizontally');
+          assert(await test.submit.evaluate(node => {
+            const box = node.getBoundingClientRect();
+            return node.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2));
+          }), 'Approval button must not be covered by another element');
+        }
+      }
+      await test.page.setViewportSize({ width: 1280, height: 960 });
       await test.confirm();
       await expect(test.submit).toBeEnabled();
       mkdirSync(path.join(dataDir, 'screenshots'), { recursive: true });
