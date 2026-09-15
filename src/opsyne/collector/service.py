@@ -199,16 +199,29 @@ class Collector:
         source_id: str,
         events: Sequence[RawInput],
         now: float | None = None,
+        *,
+        originals: Sequence[bytes] | None = None,
     ) -> list[RawEvent]:
-        """Commit a whole push batch, or roll it back on conflict or invalid input."""
+        """Commit one push batch. Connectors may supply exact bytes behind a projection."""
         if len(events) > 500:
             raise ValueError("batch exceeds 500 events")
+        if originals is not None and len(originals) != len(events):
+            raise ValueError("original byte count must match event count")
         received_at = _now(now)
         with self.db.connection() as connection:
             source = self._source(connection, source_id)
             if source.kind != "push":
                 raise ValueError("file sources are ingested only by their registered collector")
-            return [self._insert(connection, source, event, received_at) for event in events]
+            return [
+                self._insert(
+                    connection,
+                    source,
+                    event,
+                    received_at,
+                    original=None if originals is None else originals[index],
+                )
+                for index, event in enumerate(events)
+            ]
 
     def pending(self, limit: int = 100) -> list[RawEvent]:
         with self.db.connection() as connection:

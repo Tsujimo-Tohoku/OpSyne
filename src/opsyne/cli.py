@@ -14,6 +14,7 @@ import uvicorn
 
 from opsyne.api.app import create_app
 from opsyne.control.repository import Control
+from opsyne.server_config import ServerSettings
 from opsyne.storage.instance import InstanceLock
 
 
@@ -97,7 +98,8 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     serve = commands.add_parser("serve", help="APIとWeb画面を起動")
     serve.add_argument("--data-dir", type=Path, default=Path(".local/opsyne"))
-    serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--host", help="待受IPアドレス (既定127.0.0.1)")
+    serve.add_argument("--port", type=int, help="待受ポート (既定8765)")
     serve.add_argument("--env-file", type=Path, help="明示したUTF-8 KEY=VALUE設定を読み込む")
     for name in ("backup", "restore"):
         command = commands.add_parser(name, help="停止中の状態を退避/復元")
@@ -107,10 +109,18 @@ def main() -> int:
     if args.command == "serve":
         if args.env_file is not None:
             load_env(args.env_file)
-        app = create_app(args.data_dir)
-        print(f"OpSyne: http://127.0.0.1:{args.port}")
+        settings = ServerSettings.from_env(host=args.host, port=args.port)
+        app = create_app(args.data_dir, server_settings=settings)
+        print(f"OpSyne: http://{settings.host}:{settings.port}")
         print(f"ログイン用トークン: {(args.data_dir / 'tokens.json').resolve()}")
-        uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+        uvicorn.run(
+            app,
+            host=settings.host,
+            port=settings.port,
+            log_level="warning",
+            proxy_headers=True,
+            forwarded_allow_ips=settings.trusted_proxies,
+        )
     elif args.command == "backup":
         backup(args.source.resolve(), args.destination.resolve())
         print("バックアップ完了 (認証情報を含みます)")

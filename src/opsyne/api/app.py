@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -16,6 +17,7 @@ from pydantic import Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from opsyne.api.auth import AccessTokens
+from opsyne.api.heroku import install_heroku_drain, load_drains
 from opsyne.contracts.adapter_reviews import AdapterDraftRequest, ExplanationUpdate
 from opsyne.contracts.core import Actor, Model, Service
 from opsyne.contracts.execution import Capability, CheckConfig
@@ -23,6 +25,7 @@ from opsyne.contracts.observations import RawInput, Source
 from opsyne.contracts.service_views import ServicePage, ServiceSummary
 from opsyne.control.repository import Conflict
 from opsyne.runtime import Runtime
+from opsyne.server_config import ServerSettings
 from opsyne.service_queries import Collection, ServiceQueries
 
 
@@ -47,7 +50,10 @@ def create_app(
     *,
     background: bool = True,
     runtime: Runtime | None = None,
+    server_settings: ServerSettings | None = None,
 ) -> FastAPI:
+    settings = server_settings or ServerSettings.from_env()
+    drains = load_drains()
     state = runtime or Runtime(
         Path(data_dir),
         api_key=os.environ.get("OPENAI_API_KEY"),
@@ -83,9 +89,8 @@ def create_app(
         openapi_url=None,
     )
     app.state.runtime = state
-    app.add_middleware(
-        TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "testserver"]
-    )
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
+    install_heroku_drain(app, state, drains)
 
     @app.middleware("http")
     async def local_request_boundary(request: Request, call_next: Any) -> Response:
@@ -109,7 +114,7 @@ def create_app(
             if request.headers.get("transfer-encoding"):
                 return JSONResponse({"detail": "Content-Lengthを指定してください"}, status_code=411)
             length = request.headers.get("content-length", "0")
-            if not length.isdigit() or int(length) > 2_000_000:
+            if re.fullmatch(r"[0-9]{1,7}", length) is None or int(length) > 2_000_000:
                 return JSONResponse({"detail": "要求サイズ上限を超えています"}, status_code=413)
         response: Response = await call_next(request)
         response.headers["Content-Security-Policy"] = (
