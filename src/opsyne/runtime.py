@@ -71,6 +71,8 @@ class Runtime:
                 pass
         self.control = Control(self.data_dir / "control.sqlite3", key_path.read_bytes())
         self.collector = Collector(self.data_dir / "collector.sqlite3")
+        for registered_source in self.collector.sources():
+            self.control.bind_source_scope(registered_source.id, registered_source.service_id)
         self.runner = Runner(self.data_dir / "runner.sqlite3")
         self.demo = DemoConnector(self.data_dir / "demo.sqlite3")
         self.http = HttpConnector()
@@ -309,7 +311,14 @@ class Runtime:
             self.control.execution_finished(plan_id, result.status)
             status = {"SUCCEEDED": "VERIFYING", "FAILED": "OPEN"}.get(result.status, "EXECUTING")
             self.control.case_status(plan.case_id, status)
-            self.control.audit(actor.actor, "execution.request", result.id, result.status)
+            self.control.audit(
+                actor.actor,
+                "execution.request",
+                result.id,
+                result.status,
+                service_id=result.service_id,
+                object_kind="execution",
+            )
             return result
 
     def reconcile(self, execution_id: str, actor: Actor) -> Execution:
@@ -326,7 +335,14 @@ class Runtime:
                 self.demo.lookup if capability.kind == "demo.restore" else self.http.lookup,
             )
             self.control.execution_finished(plan.id, result.status)
-            self.control.audit(actor.actor, "execution.reconcile", execution_id, result.status)
+            self.control.audit(
+                actor.actor,
+                "execution.reconcile",
+                execution_id,
+                result.status,
+                service_id=result.service_id,
+                object_kind="execution",
+            )
             return result
 
     def verify(self, execution_id: str, actor: Actor) -> VerificationResult:
@@ -343,7 +359,13 @@ class Runtime:
             with self.control.db.connection() as db:
                 self.control._put(db, "verification", execution_id, result.model_dump(mode="json"))
                 self.control._audit(
-                    db, actor.actor, "execution.verify", execution_id, result.status
+                    db,
+                    actor.actor,
+                    "execution.verify",
+                    execution_id,
+                    result.status,
+                    service_id=execution.service_id,
+                    object_kind="execution",
                 )
             # Availability recovery does not establish parsing correctness or SOC eradication.
             if result.status == "PASS" and execution.status == "SUCCEEDED":
@@ -579,6 +601,7 @@ class Runtime:
                 stale_after_seconds=86400,
             )
             self.collector.register_source(source)
+            self.control.bind_source_scope(source.id, source.service_id)
             try:
                 self.control.get("adapter", "demo-json-v1")
             except KeyError:
