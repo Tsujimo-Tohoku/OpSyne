@@ -1,4 +1,5 @@
-// Browser acceptance test against a fresh, isolated local server without real credentials.
+// Browser acceptance test against a fresh, isolated local server with background=True.
+// Disable automatic investigation and remove real LLM credentials before starting the server.
 // NODE_PATH must resolve Playwright; args: loopback URL, isolated data directory.
 const { chromium, expect } = require('playwright/test');
 const { readFileSync, mkdirSync } = require('node:fs');
@@ -29,21 +30,28 @@ const { randomUUID } = require('node:crypto');
   const passed = [];
   const done = name => { passed.push(name); console.log(`PASS: ${name}`); };
   try {
-    const prepare = async (actor = 'owner', proposer = 'operator') => {
-      const reason = `Recovery browser acceptance ${randomUUID()}`;
-      const plan = await request(`/cases/${incident.id}/plans`, { capability_id: 'demo-restore', reason }, proposer);
+    const login = async actor => {
       const page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
       page.on('pageerror', error => errors.push(error.message));
-      const writes = [];
-      page.on('request', req => { if (req.method() === 'POST') writes.push(new URL(req.url()).pathname); });
       await page.goto(base);
       await page.getByLabel('アクセストークン', { exact: true }).fill(token(actor));
       await page.getByRole('button', { name: 'ワークスペースに接続' }).click();
       await expect(page.locator('#auth-dialog')).not.toBeVisible();
+      return page;
+    };
+    const openIncident = async page => {
+      await page.locator('a[data-view="cases"]').click();
+      await page.getByRole('button', { name: 'サンプル: 注文処理を復旧してください', exact: true }).click();
+    };
+    const prepare = async (actor = 'owner', proposer = 'operator') => {
+      const reason = `Recovery browser acceptance ${randomUUID()}`;
+      const plan = await request(`/cases/${incident.id}/plans`, { capability_id: 'demo-restore', reason }, proposer);
+      const page = await login(actor);
+      const writes = [];
+      page.on('request', req => { if (req.method() === 'POST') writes.push(new URL(req.url()).pathname); });
       const open = async (execute = false) => {
         if (await page.locator('#action-dialog').isVisible()) await page.locator('#dialog-close').click();
-        await page.locator('a[data-view="cases"]').click();
-        await page.getByRole('button', { name: 'サンプル: 注文処理を復旧してください', exact: true }).click();
+        await openIncident(page);
         const card = page.locator('article.plan-card').filter({ has: page.getByText(reason, { exact: true }) });
         await card.getByRole('button', { name: execute ? '復旧処理を開始' : '固定計画を確認', exact: true }).click();
       };
@@ -54,11 +62,19 @@ const { randomUUID } = require('node:crypto');
       const executionRequests = () => writes.filter(url => url.endsWith('/execute'));
       return { page, plan, writes, open, confirm, submit, feedback, executionRequests };
     };
-    const mockApproval = async test => {
-      await test.page.route(`**/api/plans/${test.plan.id}/approve`, route => route.fulfill({ json: { ...test.plan, status: 'APPROVED' } }));
+    const job = (test, status) => ({ plan_id: test.plan.id, status, detail: `Synthetic recovery ${status}` });
+    const mockRecovery = async (test, statuses) => {
+      const pending = [...statuses];
+      await test.page.route(`**/api/plans/${test.plan.id}/approve-and-execute`, route => route.fulfill({ json: job(test, 'QUEUED') }));
+      await test.page.route(`**/api/plans/${test.plan.id}/recovery`, route => route.fulfill({ json: job(test, pending.length > 1 ? pending.shift() : pending[0]) }));
+    };
+    const legacyExecution = async test => {
+      await request(`/plans/${test.plan.id}/approve`, { digest: test.plan.digest }, 'reviewer');
+      await test.open(true);
+      test.submit = test.page.getByRole('button', { name: '復旧を実行して確認', exact: true });
     };
     const mockExecution = async (test, status) => {
-      await mockApproval(test);
+      await legacyExecution(test);
       await test.page.route(`**/api/plans/${test.plan.id}/execute`, route => route.fulfill({ json: { id: `synthetic-${test.plan.id}`, plan_id: test.plan.id, status } }));
     };
     const start = async test => { await test.confirm(); await test.submit.click(); };
@@ -74,13 +90,13 @@ const { randomUUID } = require('node:crypto');
 
     {
       const test = await prepare('reviewer');
-      await test.confirm();
-      await test.page.getByRole('button', { name: 'この計画を承認', exact: true }).click();
-      await expect(test.feedback).toContainText('実行権限のある担当者');
-      assert.equal((await request(`/cases/${incident.id}`)).plans.find(plan => plan.id === test.plan.id).status, 'APPROVED');
-      assert.equal(test.executionRequests().length, 0);
+      await mockRecovery(test, ['EXECUTING', 'VERIFYING', 'COMPLETED']);
+      await start(test);
+      await expect(test.feedback).toContainText('Synthetic recovery COMPLETED', { timeout: 10000 });
+      await expect(test.page.locator('.recovery-progress')).toContainText('復旧確認：正常性を確認');
+      assert.deepEqual(test.writes.map(url => url.split('/').at(-1)), ['approve-and-execute']);
       await test.page.close();
-    done('Approver-only session saves approval and waits for an operator');
+      done('Approver submits once and displays server execution and verification progress');
     }
     {
       const test = await prepare('operator');
@@ -107,9 +123,9 @@ const { randomUUID } = require('node:crypto');
     }
     {
       const test = await prepare();
-      await test.page.route(`**/api/plans/${test.plan.id}/approve`, route => route.fulfill({ status: 409, json: { detail: '対象の版が変更されました' } }));
+      await test.page.route(`**/api/plans/${test.plan.id}/approve-and-execute`, route => route.fulfill({ status: 409, json: { detail: '対象の版が変更されました' } }));
       await start(test);
-      await expect(test.feedback).toContainText('復旧処理は要求していません');
+      await expect(test.feedback).toContainText('対象の版が変更されました');
       await expect(test.submit).toBeDisabled();
       assert.equal(test.executionRequests().length, 0);
       await test.page.close();
@@ -117,16 +133,36 @@ const { randomUUID } = require('node:crypto');
     }
     {
       const test = await prepare();
-      await test.page.route(`**/api/plans/${test.plan.id}/approve`, async route => {
-        await route.fetch(); // Commit approval but lose its response.
-        await route.abort('failed');
-      });
+      await test.page.route(`**/api/plans/${test.plan.id}/approve-and-execute`, route => route.abort('failed'));
       await start(test);
-      await expect(test.feedback).toContainText('復旧処理は要求していません');
-      assert.equal((await request(`/cases/${incident.id}`)).plans.find(plan => plan.id === test.plan.id).status, 'APPROVED');
-      assert.equal(test.executionRequests().length, 0);
+      await expect(test.feedback).toContainText('サーバーで処理中の可能性があります');
+      await expect(test.submit).toBeDisabled();
+      assert.deepEqual(test.writes.map(url => url.split('/').at(-1)), ['approve-and-execute']);
       await test.page.close();
-      done('Lost approval response does not dispatch an execution');
+      done('Lost receipt stays uncertain and does not resubmit approval or dispatch execution');
+    }
+    for (const status of ['FAILED', 'UNKNOWN', 'BLOCKED', 'CHECK_FAILED']) {
+      const test = await prepare(); await mockRecovery(test, [status]);
+      await start(test);
+      await expect(test.feedback).toContainText(`Synthetic recovery ${status}`);
+      await expect(test.feedback).toHaveClass(/warning/);
+      await expect(test.page.locator('.recovery-progress')).toContainText('復旧確認：未完了');
+      await expect(test.submit).toBeDisabled();
+      assert.deepEqual(test.writes.map(url => url.split('/').at(-1)), ['approve-and-execute']);
+      await test.page.close();
+    }
+    done('Failed, unknown, blocked and failed-check jobs are unresolved without automatic retries');
+    {
+      const test = await prepare(); await mockRecovery(test, ['EXECUTING']);
+      await test.page.route(`**/api/plans/${test.plan.id}/recovery`, route => route.abort('failed'));
+      await start(test);
+      await expect(test.feedback).toContainText('サーバーで処理中の可能性があります');
+      await expect(test.page.locator('.recovery-progress')).toContainText('承認：完了');
+      await expect(test.page.locator('.recovery-progress')).toContainText('復旧確認：状態不明');
+      await expect(test.submit).toBeDisabled();
+      assert.deepEqual(test.writes.map(url => url.split('/').at(-1)), ['approve-and-execute']);
+      await test.page.close();
+      done('Lost progress response preserves accepted approval and never resends');
     }
     for (const status of ['FAILED', 'UNKNOWN', 'IN_FLIGHT']) {
       const test = await prepare(); await mockExecution(test, status);
@@ -139,7 +175,7 @@ const { randomUUID } = require('node:crypto');
     }
     done('Failed, unknown and unfinished executions never claim recovery or auto-retry');
     {
-      const test = await prepare(); await mockApproval(test);
+      const test = await prepare(); await legacyExecution(test);
       await test.page.route(`**/api/plans/${test.plan.id}/execute`, route => route.abort('failed'));
       await start(test);
       await expect(test.feedback).toContainText('再実行せず、実行記録と監査ログ');
@@ -163,23 +199,23 @@ const { randomUUID } = require('node:crypto');
       const test = await prepare();
       let release;
       const gate = new Promise(resolve => { release = resolve; });
-      await test.page.route(`**/api/plans/${test.plan.id}/approve`, async route => {
+      await test.page.route(`**/api/plans/${test.plan.id}/approve-and-execute`, async route => {
         await gate;
-        await route.fulfill({ json: { ...test.plan, status: 'APPROVED' } });
+        await route.fulfill({ json: job(test, 'QUEUED') });
       });
       await start(test);
       await expect(test.page.locator('.recovery-progress')).toContainText('承認：処理中');
       await test.page.locator('#dialog-close').click();
-      const response = test.page.waitForResponse(`**/api/plans/${test.plan.id}/approve`);
+      const response = test.page.waitForResponse(`**/api/plans/${test.plan.id}/approve-and-execute`);
       release(); await response;
       // Synchronize with the response handler instead of relying on an arbitrary delay.
       await expect(test.page.getByRole('button', { name: '承認して復旧を実行', exact: true, includeHidden: true })).not.toHaveAttribute('aria-busy', 'true');
       assert.equal(test.executionRequests().length, 0);
       await test.page.close();
-      done('Closing the review during approval stops later requests');
+      done('Closing the review during submission does not send separate execution requests');
     }
     {
-      const test = await prepare();
+      const test = await prepare('reviewer');
       for (const viewport of [{ width: 1280, height: 600 }, { width: 390, height: 600 }, { width: 700, height: 360 }]) {
         await test.page.setViewportSize(viewport);
         for (const scroll of [0, 100000]) {
@@ -199,25 +235,43 @@ const { randomUUID } = require('node:crypto');
       mkdirSync(path.join(dataDir, 'screenshots'), { recursive: true });
       await test.submit.scrollIntoViewIfNeeded();
       await test.page.screenshot({ path: path.join(dataDir, 'screenshots', 'approval.png') });
+      // Persist the real job, then lose the response and close the browser before it
+      // can request progress. Only the server may execute and verify the operation.
+      let receipt;
+      const committed = new Promise(resolve => { receipt = resolve; });
+      let release;
+      const gate = new Promise(resolve => { release = resolve; });
+      await test.page.route(`**/api/plans/${test.plan.id}/approve-and-execute`, async route => {
+        const response = await route.fetch();
+        assert(response.ok());
+        receipt(await response.json());
+        await gate;
+        await route.abort('failed');
+      });
       await test.submit.evaluate(button => { button.click(); button.click(); });
-      await expect(test.feedback).toContainText('サービスが登録された正常性の条件を満たす');
-      assert.deepEqual(test.writes.map(url => url.split('/').at(-1)), ['approve', 'execute', 'verify']);
+      const accepted = await committed;
+      assert.equal(accepted.plan_id, test.plan.id);
+      assert.deepEqual(test.writes.map(url => url.split('/').at(-1)), ['approve-and-execute']);
+      await test.page.close(); release();
+      await expect.poll(async () => (await request(`/plans/${test.plan.id}/recovery`)).status, { timeout: 20000 }).toBe('COMPLETED');
+      const repeated = await request(`/plans/${test.plan.id}/approve-and-execute`, { digest: test.plan.digest }, 'reviewer');
+      assert.equal(repeated.status, 'COMPLETED');
       const detail = await request(`/cases/${incident.id}`);
       assert.equal(detail.case.status, 'RESOLVED');
       assert.equal(detail.executions.length, 1);
       assert.equal(detail.executions[0].status, 'SUCCEEDED');
       assert.equal(detail.executions[0].verification.status, 'PASS');
       assert.equal(detail.executions[0].verification.evidence.change_count, 1);
-      await test.feedback.scrollIntoViewIfNeeded();
-      await test.page.screenshot({ path: path.join(dataDir, 'screenshots', 'recovered.png') });
-      await test.page.setViewportSize({ width: 390, height: 844 });
-      assert(await test.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
-      await test.feedback.scrollIntoViewIfNeeded();
-      await test.page.screenshot({ path: path.join(dataDir, 'screenshots', 'recovered-mobile.png') });
-      await test.page.getByRole('button', { name: '案件と実行記録を確認' }).click();
-      await expect(test.page.locator('#dialog-content')).toContainText('復旧確認済み');
-      await test.page.close();
-      done('Real approval → exactly one target change → independent PASS → resolved; mobile layout');
+      const reopened = await login('owner');
+      await openIncident(reopened);
+      await expect(reopened.locator('#dialog-content')).toContainText('復旧確認済み');
+      await expect(reopened.locator('#dialog-content')).toContainText('COMPLETED');
+      await reopened.screenshot({ path: path.join(dataDir, 'screenshots', 'recovered.png') });
+      await reopened.setViewportSize({ width: 390, height: 844 });
+      assert(await reopened.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+      await reopened.screenshot({ path: path.join(dataDir, 'screenshots', 'recovered-mobile.png') });
+      await reopened.close();
+      done('Real approver receipt lost and browser closed → one change → independent PASS → resolved after reopening; duplicate approval and mobile layout');
     }
     assert.deepEqual(errors, []);
     console.log(`PASS: ${passed.length} scenario groups; no browser JavaScript errors`);

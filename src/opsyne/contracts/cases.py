@@ -29,12 +29,20 @@ class EvidenceClaim(Model):
     evidence_ids: list[str]
 
 
+class RecoveryChoice(Model):
+    capability_id: str
+    capability_version: int
+    reason: str
+    evidence_ids: list[str]
+
+
 class Analysis(Model):
     summary: str
     facts: list[EvidenceClaim]
     hypotheses: list[EvidenceClaim]
     unknowns: list[str]
     recommendations: list[str]
+    recovery: RecoveryChoice | None = None
 
 
 class Task(Model):

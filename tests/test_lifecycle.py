@@ -683,8 +683,13 @@ def test_expired_task_with_unsaved_result_is_failed_without_resending_model_call
     calls: list[str] = []
 
     def investigate(
-        self: Investigator, claimed: Task, evidence: list[dict[str, JsonValue]]
+        self: Investigator,
+        claimed: Task,
+        evidence: list[dict[str, JsonValue]],
+        recovery_context: dict[str, JsonValue] | None = None,
     ) -> Analysis:
+        assert recovery_context is not None
+        assert recovery_context["capabilities"]
         calls.append(claimed.id)
         return Analysis(
             summary="Synthetic response",
