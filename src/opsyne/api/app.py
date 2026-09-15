@@ -18,6 +18,7 @@ from pydantic import Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from opsyne.api.auth import AccessTokens
+from opsyne.api.discord import register_discord
 from opsyne.api.heroku import install_heroku_drain, load_drains
 from opsyne.collector.log_discovery import discover_logs
 from opsyne.contracts.adapter_reviews import AdapterDraftRequest, ExplanationUpdate
@@ -94,6 +95,9 @@ def create_app(
     app.state.runtime = state
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
     install_heroku_drain(app, state, drains)
+    discord_config = os.environ.get("OPSYNE_DISCORD_CONFIG")
+    if discord_config:
+        register_discord(app, state.control, tokens, Path(discord_config))
 
     @app.middleware("http")
     async def local_request_boundary(request: Request, call_next: Any) -> Response:

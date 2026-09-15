@@ -22,6 +22,7 @@ class Settings:
     bot_token: str = field(default="", repr=False)
     bridge_url: str = ""
     bridge_token: str = field(default="", repr=False)
+    feed_url: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -38,8 +39,12 @@ class Settings:
             raise ValueError("DISCORD_INGEST_TOKEN requires at least 32 characters")
         if bool(self.bridge_url) != bool(self.bridge_token):
             raise ValueError("Bridge URL and token must be configured together")
-        if self.bridge_url:
-            parsed = urlsplit(self.bridge_url)
+        if self.feed_url and not self.bridge_token:
+            raise ValueError("Feed requires the bridge token")
+        for url in (self.bridge_url, self.feed_url):
+            if not url:
+                continue
+            parsed = urlsplit(url)
             local = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
             if (
                 not parsed.hostname
@@ -47,7 +52,7 @@ class Settings:
                 or parsed.password
                 or parsed.query
                 or parsed.fragment
-                or any(character.isspace() for character in self.bridge_url)
+                or any(character.isspace() for character in url)
                 or not (parsed.scheme == "https" or (local and parsed.scheme == "http"))
             ):
                 raise ValueError("Bridge URL must be HTTPS (HTTP allowed only for loopback tests)")
@@ -71,4 +76,5 @@ def from_environment() -> Settings:
         bot_token=os.environ.get("DISCORD_BOT_TOKEN", ""),
         bridge_url=os.environ.get("DISCORD_CONTROL_BRIDGE_URL", ""),
         bridge_token=os.environ.get("DISCORD_CONTROL_BRIDGE_TOKEN", ""),
+        feed_url=os.environ.get("DISCORD_CONTROL_FEED_URL", ""),
     )

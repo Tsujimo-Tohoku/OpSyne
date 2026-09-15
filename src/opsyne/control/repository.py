@@ -62,14 +62,43 @@ class Control:
                 scope TEXT NOT NULL CHECK(scope IN ('service','global','unknown')));
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
             INSERT OR IGNORE INTO metadata VALUES ('generation','1');
+            CREATE TABLE IF NOT EXISTS discord_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL,
+                service_id TEXT NOT NULL, body TEXT NOT NULL);
         """)
 
     @staticmethod
     def _put(db: sqlite3.Connection, kind: str, object_id: str, body: JsonValue) -> None:
+        encoded = canonical(body)
+        old = db.execute(
+            "SELECT body FROM objects WHERE kind=? AND id=?", (kind, object_id)
+        ).fetchone()
+        if kind == "case" and isinstance(body, dict) and (old is None or old[0] != encoded):
+            plans = db.execute(
+                "SELECT id FROM objects WHERE kind='plan' AND json_extract(body,'$.case_id')=? "
+                "AND json_extract(body,'$.status')='DRAFT' ORDER BY id LIMIT 5",
+                (object_id,),
+            ).fetchall()
+            summary = "案件の状態が更新されました。詳細は本体で確認してください。"
+            if plans:
+                summary += "\n確認待ち計画: " + ", ".join(row[0] for row in plans)
+            # Keep raw evidence, titles derived from logs, and LLM prose off Discord.
+            snapshot: JsonValue = {
+                "case_id": object_id,
+                "title": "OpSyne 案件更新",
+                "state": body.get("status", "UNKNOWN"),
+                "summary": summary,
+                "observed_at": body.get("updated_at"),
+                "evidence_refs": [],
+            }
+            db.execute(
+                "INSERT INTO discord_events(event_id,service_id,body) VALUES (?,?,?)",
+                (identifier("discord"), body["service_id"], canonical(snapshot)),
+            )
         db.execute(
             "INSERT INTO objects VALUES (?,?,?) "
             "ON CONFLICT(kind,id) DO UPDATE SET body=excluded.body",
-            (kind, object_id, canonical(body)),
+            (kind, object_id, encoded),
         )
 
     @staticmethod
@@ -461,36 +490,48 @@ class Control:
         if actor.role not in {"admin", "approver"}:
             raise Denied("承認権限が必要です")
         with self.db.connection() as db:
-            body = self._get(db, "plan", plan_id)
-            plan = self.plan_model(body)
-            self._current(db, plan, at)
-            if plan.proposer == actor.actor:
-                raise Denied("提案者本人は承認できません。別の承認者を使用してください")
-            if body["status"] != "DRAFT" or not hmac.compare_digest(plan.digest, expected_digest):
-                raise Conflict("固定された計画のdigestと状態を確認してください")
-            generation = int(
-                db.execute("SELECT value FROM metadata WHERE key='generation'").fetchone()[0]
-            )
-            body.update(
-                status="APPROVED", approver=actor.actor, approved_at=at, generation=generation
-            )
-            self._put(db, "plan", plan_id, body)
-            self._audit(db, actor.actor, "plan.approve", plan_id, plan.digest)
-            return body
+            return self._approve(db, plan_id, expected_digest, actor, at)
+
+    def _approve(
+        self, db: sqlite3.Connection, plan_id: str, expected_digest: str, actor: Actor, at: float
+    ) -> dict[str, Any]:
+        if actor.role not in {"admin", "approver"}:
+            raise Denied("承認権限が必要です")
+        body = self._get(db, "plan", plan_id)
+        plan = self.plan_model(body)
+        self._current(db, plan, at)
+        if plan.proposer == actor.actor:
+            raise Denied("提案者本人は承認できません。別の承認者を使用してください")
+        if body["status"] != "DRAFT" or not hmac.compare_digest(plan.digest, expected_digest):
+            raise Conflict("固定された計画のdigestと状態を確認してください")
+        generation = int(
+            db.execute("SELECT value FROM metadata WHERE key='generation'").fetchone()[0]
+        )
+        body.update(status="APPROVED", approver=actor.actor, approved_at=at, generation=generation)
+        self._put(db, "plan", plan_id, body)
+        self._audit(db, actor.actor, "plan.approve", plan_id, plan.digest)
+        return body
 
     def reject(self, plan_id: str, actor: Actor, reason: str) -> dict[str, Any]:
         if actor.role not in {"admin", "approver"}:
             raise Denied("承認権限が必要です")
         with self.db.connection() as db:
-            body = self._get(db, "plan", plan_id)
-            if db.execute("SELECT 1 FROM claims WHERE plan_id=?", (plan_id,)).fetchone():
-                raise Conflict("操作結果の確認が必要です")
-            if body["status"] not in {"DRAFT", "APPROVED"}:
-                raise Conflict("この状態の計画は却下できません")
-            body.update(status="REJECTED", rejection_reason=reason[:2000])
-            self._put(db, "plan", plan_id, body)
-            self._audit(db, actor.actor, "plan.reject", plan_id, reason)
-            return body
+            return self._reject(db, plan_id, actor, reason)
+
+    def _reject(
+        self, db: sqlite3.Connection, plan_id: str, actor: Actor, reason: str
+    ) -> dict[str, Any]:
+        if actor.role not in {"admin", "approver"}:
+            raise Denied("承認権限が必要です")
+        body = self._get(db, "plan", plan_id)
+        if db.execute("SELECT 1 FROM claims WHERE plan_id=?", (plan_id,)).fetchone():
+            raise Conflict("操作結果の確認が必要です")
+        if body["status"] not in {"DRAFT", "APPROVED"}:
+            raise Conflict("この状態の計画は却下できません")
+        body.update(status="REJECTED", rejection_reason=reason[:2000])
+        self._put(db, "plan", plan_id, body)
+        self._audit(db, actor.actor, "plan.reject", plan_id, reason)
+        return body
 
     def issue_permit(self, plan_id: str, now: float | None = None) -> ExecutionPermit:
         at = time.time() if now is None else now

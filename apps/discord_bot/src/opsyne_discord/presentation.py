@@ -48,6 +48,8 @@ class PlanView:
     abort_conditions: tuple[str, ...]
     expires_at: str
     approval_request_id: str
+    state: str = "DRAFT"
+    approver: str = ""
 
 
 def _units(value: str) -> int:
@@ -172,7 +174,9 @@ def render_plan(plan: PlanView) -> dict[str, Any]:
     """
     terms = [
         ("計画ID", plan.plan_id),
-        ("計画の版", str(plan.version)),
+        ("現在の計画状態", plan.state),
+        ("承認者", plan.approver or "未記録"),
+        ("表示形式の版", str(plan.version)),
         ("計画のdigest", plan.digest),
         ("対象実体", plan.target_id),
         ("対象の版", plan.target_version),
@@ -205,7 +209,7 @@ def render_plan(plan: PlanView) -> dict[str, Any]:
                 ),
                 "fields": [
                     _field("計画ID (参照用)", _clip(_plain(plan.plan_id).strip() or "欠落", 256)),
-                    _field("計画の版 (参照用)", _clip(str(plan.version), 256)),
+                    _field("表示形式の版 (参照用)", _clip(str(plan.version), 256)),
                 ],
                 "color": 0xC47F00,
                 "footer": {"text": _SNAPSHOT_NOTE},
@@ -220,6 +224,8 @@ def render_plan(plan: PlanView) -> dict[str, Any]:
             "footer": {"text": _SNAPSHOT_NOTE},
         }
     )
+    if plan.state != "DRAFT":
+        return payload
     payload["components"] = [
         {
             "type": 1,

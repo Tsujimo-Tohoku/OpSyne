@@ -11,6 +11,15 @@ import pytest
 from opsyne_discord.presentation import CaseView, PlanView, render_case, render_plan
 
 
+@pytest.mark.parametrize("state", ["APPROVED", "EXECUTED", "REJECTED", "UNKNOWN"])
+def test_non_draft_plan_is_read_only(state: str) -> None:
+    payload = render_plan(replace(_plan(), state=state, approver="reviewer"))
+    assert not payload.get("components")
+    fields = {field["name"]: field["value"] for field in payload["embeds"][0]["fields"]}
+    assert fields["現在の計画状態"] == state
+    assert fields["承認者"] == "reviewer"
+
+
 def _plan() -> PlanView:
     return PlanView(
         plan_id="P-87",
@@ -120,7 +129,7 @@ def test_complete_plan_displays_all_terms_and_only_starts_review() -> None:
     _assert_limits(payload)
     fields = {field["name"]: field["value"] for field in payload["embeds"][0]["fields"]}
     assert fields["計画ID"] == plan.plan_id
-    assert fields["計画の版"] == "3"
+    assert fields["表示形式の版"] == "3"
     assert fields["計画のdigest"] == plan.digest
     assert fields["対象実体"] == plan.target_id
     assert fields["対象の版"] == plan.target_version
