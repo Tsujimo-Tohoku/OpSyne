@@ -13,6 +13,13 @@
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}.spinner{animation:none}}
 
 .adapter-explanation .analysis-text,.adapter-explanation .field-hint{overflow-wrap:anywhere}
+.log-discovery{border-top:1px solid var(--border);padding-top:16px;min-width:0}
+.log-discovery[hidden]{display:none}
+.log-discovery h3{font-size:14px;margin:0 0 8px}
+.log-discovery>.button{justify-self:start}
+.discovery-results{display:grid;gap:12px;min-width:0}
+.discovery-candidate{border:1px solid var(--border);border-radius:8px;padding:12px;min-width:0}
+.discovery-candidate strong,.discovery-results .field-hint{overflow-wrap:anywhere}
 
 /* Keep recovery consent and actions visible while the plan scrolls independently. */
 .action-dialog.recovery-review[open]{display:flex;flex-direction:column;max-height:calc(100dvh - 32px);overflow:hidden}
