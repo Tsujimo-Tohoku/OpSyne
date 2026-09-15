@@ -13,6 +13,8 @@ from pathlib import Path
 import uvicorn
 
 from opsyne.api.app import create_app
+from opsyne.collector.log_discovery import discover_logs
+from opsyne.contracts.log_discovery import LogDiscoveryRequest
 from opsyne.control.repository import Control
 from opsyne.server_config import ServerSettings
 from opsyne.storage.instance import InstanceLock
@@ -101,12 +103,25 @@ def main() -> int:
     serve.add_argument("--host", help="待受IPアドレス (既定127.0.0.1)")
     serve.add_argument("--port", type=int, help="待受ポート (既定8765)")
     serve.add_argument("--env-file", type=Path, help="明示したUTF-8 KEY=VALUE設定を読み込む")
+    discovery = commands.add_parser(
+        "discover-logs", help="既存の読取権限でログ候補を探索 (JSON出力)"
+    )
+    discovery.add_argument(
+        "--root", action="append", required=True, help="アプリのフォルダー。複数指定可能"
+    )
     for name in ("backup", "restore"):
         command = commands.add_parser(name, help="停止中の状態を退避/復元")
         command.add_argument("source", type=Path)
         command.add_argument("destination", type=Path)
     args = parser.parse_args()
-    if args.command == "serve":
+    if args.command == "discover-logs":
+        try:
+            result = discover_logs(LogDiscoveryRequest(roots=args.root))
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(result.model_dump_json(indent=2))
+        return 0 if result.status == "completed" else 2
+    elif args.command == "serve":
         if args.env_file is not None:
             load_env(args.env_file)
         settings = ServerSettings.from_env(host=args.host, port=args.port)

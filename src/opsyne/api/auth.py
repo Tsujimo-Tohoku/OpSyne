@@ -14,6 +14,7 @@ from opsyne.contracts.core import Actor
 
 class AccessTokens:
     def __init__(self, path: Path) -> None:
+        self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             entries = [
@@ -47,3 +48,12 @@ class AccessTokens:
             if hmac.compare_digest(known, candidate):
                 return actor
         return None
+
+    def named_actor(self, name: str) -> Actor | None:
+        """Resolve Discord bindings against the current local identity registry."""
+        actors = [
+            Actor(actor=item["actor"], role=item["role"])
+            for item in json.loads(self.path.read_text(encoding="utf-8"))
+            if item["actor"] == name
+        ]
+        return actors[0] if len(actors) == 1 else None

@@ -1,8 +1,10 @@
+import sqlite3
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from pydantic import JsonValue
 
 from opsyne.contracts.cases import Analysis, RecoveryChoice
 from opsyne.contracts.core import Actor
@@ -80,3 +82,31 @@ def test_duplicate_analysis_does_not_duplicate_plan(tmp_path: Path) -> None:
     runtime.control.enqueue(plan["case_id"])
     runtime.run_task()
     assert len(runtime.control.objects("plan")) == 1
+
+
+def test_recovery_save_failure_rolls_back_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, plan = proposed(tmp_path)
+    original_put = runtime.control._put
+
+    def fail_recovery(db: sqlite3.Connection, kind: str, object_id: str, body: JsonValue) -> None:
+        if kind == "recovery":
+            raise OSError("synthetic recovery persistence failure")
+        original_put(db, kind, object_id, body)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime.control, "_put", fail_recovery)
+        with pytest.raises(OSError, match="synthetic recovery persistence failure"):
+            runtime.control.approve(
+                plan["id"],
+                plan["digest"],
+                Actor(actor="reviewer", role="approver"),
+                run_recovery=True,
+            )
+
+    restarted = Runtime(tmp_path)
+    assert restarted.control.get("plan", plan["id"])["status"] == "DRAFT"
+    assert restarted.control.objects("recovery") == []
+    assert restarted.run_recovery() is None
+    assert restarted.runner.list() == []
