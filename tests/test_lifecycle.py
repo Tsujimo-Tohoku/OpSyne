@@ -29,6 +29,7 @@ from opsyne.contracts.execution import Capability, CheckConfig
 from opsyne.contracts.observations import AdapterDefinition, RawInput, Source
 from opsyne.control.repository import Control, Denied
 from opsyne.runtime import Runtime
+from opsyne.server_config import ServerSettings
 from opsyne.storage.instance import InstanceLock
 
 OWNER = Actor(actor="owner", role="admin")
@@ -448,14 +449,24 @@ def test_serve_env_file_is_loaded_before_app_creation_without_starting_server(
     captured: list[str] = []
     application = FastAPI()
 
-    def build_app(path: Path) -> FastAPI:
+    def build_app(path: Path, *, server_settings: ServerSettings) -> FastAPI:
         assert path == data_dir
+        assert server_settings.host == "127.0.0.1" and server_settings.port == 8899
         assert os.environ["OPSYNE_TEST_CLI"] == "loaded"
         captured.append("app")
         return application
 
-    def run(app: FastAPI, *, host: str, port: int, log_level: str) -> None:
+    def run(
+        app: FastAPI,
+        *,
+        host: str,
+        port: int,
+        log_level: str,
+        proxy_headers: bool,
+        forwarded_allow_ips: str,
+    ) -> None:
         assert app is application and host == "127.0.0.1" and port == 8899
+        assert proxy_headers and forwarded_allow_ips == "127.0.0.1"
         captured.append("server")
 
     monkeypatch.setattr("opsyne.cli.create_app", build_app)
