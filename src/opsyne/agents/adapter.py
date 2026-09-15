@@ -30,6 +30,8 @@ code does not establish its business meaning. Keep unsupported meanings UNKNOWN 
 in unknowns. Do not infer success or normality from absent data. For opaque or non-JSON formats,
 or when safe structure cannot be established, return fields=[] with the reason in unknowns.
 Every rationale must cite at least one supplied evidence ID. Never invent IDs or facts.
+suggested_use describes only a possible monitoring use and what the mapping could help reveal.
+It is an agent suggestion, never the user's monitoring purpose. Use null when unsupported.
 List mappings as arrays of field/path or input/output objects, with no duplicate fields or inputs.
 Specify conditions only when evidence supports them. Preserve ambiguity and truncated context.
 This is an unapproved proposal only. Target/source identities and versions are bound separately by

@@ -78,6 +78,65 @@ def demo_plan(api: API, proposer: str = "operator") -> tuple[dict[str, Any], dic
     return case, plan
 
 
+def test_adapter_explanation_api_contract(api: API) -> None:
+    api.post("/api/demo", "owner")
+    original = api.get("/api/adapters/demo-json-v1")
+    definition = api.runtime.adapters.definition(original).model_dump(mode="json")
+    definition["id"] = "review-test"
+    draft = api.post(
+        "/api/adapters",
+        body={
+            **definition,
+            "explanation": {"monitoring_purpose": "障害の把握"},
+        },
+    )
+    assert draft["explanation"]["human"]["monitoring_purpose"] == "障害の把握"
+    assert draft["explanation"]["recorded_by"] == "operator"
+    assert draft["explanation"]["agent"] is None
+    url = "/api/adapters/review-test/explanation"
+    payload = {
+        "digest": draft["digest"],
+        "explanation": {
+            "monitoring_purpose": None,
+            "expected_insights": ["処理失敗の件数"],
+            "questions": ["業務上の監視目的は未確認"],
+        },
+    }
+    assert api.client.get("/api/adapters/review-test").status_code == 401
+    for actor in ("viewer", "reviewer"):
+        assert api.client.put(url, headers=api.headers(actor), json=payload).status_code == 403
+    forged = {"digest": draft["digest"], "explanation": {"recorded_by": "reviewer"}}
+    assert api.client.put(url, headers=api.headers("owner"), json=forged).status_code == 422
+    updated = api.client.put(url, headers=api.headers("owner"), json=payload)
+    assert updated.status_code == 200
+    body = updated.json()
+    assert body["digest"] != draft["digest"]
+    assert body["explanation"]["human"]["monitoring_purpose"] is None
+    assert api.get("/api/adapters/review-test") == body
+    assert body in api.get("/api/overview")["adapters"]
+    assert api.client.put(url, headers=api.headers("owner"), json=payload).status_code == 409
+    assert (
+        api.client.post(
+            "/api/adapters/review-test/approve",
+            headers=api.headers("reviewer"),
+            json={"digest": draft["digest"]},
+        ).status_code
+        == 409
+    )
+    api.post("/api/adapters/review-test/approve", "reviewer", {"digest": body["digest"]})
+    assert (
+        api.client.put(
+            url,
+            headers=api.headers("owner"),
+            json={
+                **payload,
+                "digest": body["digest"],
+            },
+        ).status_code
+        == 409
+    )
+
+
 def approve(api: API, plan: dict[str, Any]) -> dict[str, Any]:
     return api.post(f"/api/plans/{plan['id']}/approve", "reviewer", {"digest": plan["digest"]})
 
