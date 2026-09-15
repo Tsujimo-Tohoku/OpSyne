@@ -113,6 +113,26 @@ node scripts/test_adapter_review_ui.cjs http://127.0.0.1:8766 .local/issue4-ui-c
 応答を合成データへ置換します。LLMは呼び出しません。デスクトップ・390px幅のスクリーンショットは
 指定データディレクトリの `screenshots/` に保存します。終了後はテストサーバーを停止してください。
 
+## 承認後の復旧処理のブラウザ検証（任意）
+
+`scripts/test_recovery_ui.cjs` は、提案者とは別の管理者による承認→実行→独立確認を実APIで検証します。
+合成対象の変更回数が1回で、独立確認PASS後に案件が解決することを確認します。
+自己承認・権限不足・承認専用ユーザー・承認済み計画の実行・画面を閉じた場合も検証します。
+通信途絶、競合、操作UNKNOWN、確認FAIL/UNKNOWNはブラウザの応答差し替えで試験します。
+
+上記と同じNode.js、Playwright、Microsoft Edgeの環境で、**空の専用データディレクトリ**を使い、
+バックグラウンド処理と実LLMを使わずにサーバーを起動します。使用済みデータでは再実行できません。
+
+```text
+python scripts/dev.py run --locked python -c "from pathlib import Path; from opsyne.api.app import create_app; import uvicorn; uvicorn.run(create_app(Path('.local/recovery-ui-check'), background=False), host='127.0.0.1', port=8769)"
+node --check src/opsyne/web/app.js
+node scripts/test_recovery_ui.cjs http://127.0.0.1:8769 .local/recovery-ui-check
+```
+
+サーバー起動後、別の端末でNode.jsのコマンドを実行します。スクリーンショットはデータディレクトリの
+`screenshots/` に保存します。検証後は専用サーバーを停止します。実サービスの復旧や実LLMの品質を
+検証するテストではありません。
+
 ## 問題切り分け
 
 - `uv is missing` / 版不一致: `python scripts/bootstrap.py` を再実行。
