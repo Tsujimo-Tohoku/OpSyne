@@ -100,12 +100,12 @@ function errorText(detail) {
   if (Array.isArray(detail)) return detail.map((item) => `${(item.loc || []).filter((part) => part !== "body").join(".")}: ${item.msg || JSON.stringify(item)}`).join(" / ");
   return detail ? JSON.stringify(detail) : "応答に詳細がありません。監査ログとサーバーの状態を確認してください。";
 }
-async function api(path, body, token = state.token) {
+async function api(path, body, token = state.token, method = body === undefined ? "GET" : "POST") {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 70000);
   try {
     const response = await fetch(`/api${path}`, {
-      method: body === undefined ? "GET" : "POST",
+      method,
       headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: controller.signal, cache: "no-store", credentials: "same-origin",
@@ -114,7 +114,8 @@ async function api(path, body, token = state.token) {
     try { result = await response.json(); } catch { result = null; }
     if (!response.ok) {
       if (response.status === 401 && state.session) disconnect("認証の有効性を確認できません。トークンを確認して再接続してください。");
-      throw new Error(`${response.status === 403 ? "この操作の権限がありません。" : ""}${errorText(result?.detail || result?.error || (response.status === 401 ? "トークンが正しいか確認してください。" : null))}`);
+      const failure = new Error(`${response.status === 403 ? "この操作の権限がありません。" : ""}${errorText(result?.detail || result?.error || (response.status === 401 ? "トークンが正しいか確認してください。" : null))}`);
+      failure.status = response.status; throw failure;
     }
     return result;
   } catch (error) {
@@ -671,14 +672,80 @@ function adapterForm() {
   const { fields } = createForm(body, "承認待ちとして保存", async (form) => {
     let payload;
     try { payload = JSON.parse(form.get("definition")); } catch { throw new Error("JSON の構文に誤りがあります。括弧・カンマ・引用符を確認してください。"); }
+    payload.explanation = readExplanation(form);
     await api("/adapters", payload); $("#action-dialog").close(); toast("変換定義を保存しました。別の主体による確認と承認が必要です。"); await refresh(true);
   });
   const editor = formField(fields, "宣言的な変換定義（JSON）", "definition", { type: "textarea", value: JSON.stringify(definition, null, 2), full: true }); editor.classList.add("json-input"); editor.spellcheck = false;
+  explanationFields(fields);
 }
-function openAdapter(record) {
+function explanationFields(fields, human = {}) {
+  const purpose = formField(fields, "監視目的（利用者が決めた目的）", "monitoring_purpose", { type: "textarea", value: human?.monitoring_purpose || "", full: true, required: false, hint: "不明なら空欄のまま保存します。Agentの用途案からは補完しません。" });
+  purpose.maxLength = 2000;
+  for (const [key, label, limit] of [["expected_insights", "変換によって把握したいこと", 30], ["rationale", "利用者の根拠", 30], ["questions", "確認事項", 50]]) {
+    formField(fields, label, key, { type: "textarea", value: (human?.[key] || []).join("\n"), full: true, required: false, hint: `1行に1項目。最大${limit}件、各2000文字。` });
+  }
+}
+function readExplanation(form) {
+  const value = { monitoring_purpose: String(form.get("monitoring_purpose") || "").trim() || null };
+  for (const [key, limit] of [["expected_insights", 30], ["rationale", 30], ["questions", 50]]) {
+    value[key] = String(form.get(key) || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (value[key].length > limit || value[key].some((line) => line.length > 2000)) throw new Error(`項目数は${limit}件以内、各項目は2000文字以内にしてください。`);
+  }
+  return value;
+}
+function explanationList(title, values) {
+  const list = el("ul", "detail-list");
+  for (const value of values || []) list.append(el("li", "analysis-text", value));
+  return section(title, list.children.length ? list : el("p", "analysis-text", "未記録"));
+}
+function renderAdapterExplanation(record) {
+  const human = record.explanation?.human; const agent = record.explanation?.agent;
+  const root = el("div", "adapter-explanation");
+  root.append(section("利用者の監視目的", el("p", "analysis-text", human?.monitoring_purpose || "未記録"), el("p", "field-hint", `記録者: ${record.explanation?.recorded_by || "未記録"}`)));
+  root.append(explanationList("変換によって把握したいこと", human?.expected_insights), explanationList("利用者の根拠", human?.rationale), explanationList("利用者の確認事項", human?.questions));
+  root.append(section("Agentが提案した用途", el("p", "analysis-text", agent?.suggested_use || "未記録"), el("p", "field-hint", "Agentの用途案は、利用者が決めた監視目的とは別の情報です。")));
+  const claims = el("div");
+  for (const claim of agent?.rationale || []) claims.append(append(el("div", "evidence-item"), el("p", "analysis-text", claim.text), el("p", "field-hint", `原本参照: ${(claim.evidence_ids || []).join(" / ") || "未記録"}`)));
+  root.append(section("Agentの提案根拠", claims.children.length ? claims : el("p", "analysis-text", "未記録")), explanationList("Agentが判断できないこと・確認事項", agent?.unknowns));
+  if (agent?.task_id) root.append(el("p", "field-hint", `生成タスク: ${agent.task_id}`));
+  return root;
+}
+function editAdapterExplanation(record) {
+  const body = openDialog("監視目的・説明を編集", "REVIEW EXPLANATION");
+  body.append(message("保存すると承認対象の説明が更新されます。保存後の内容を確認し、別の承認主体が承認してください。"));
+  body.append(button("最新の定義を読み直す", (event) => busy(event.currentTarget, async () => {
+    await openAdapter(record);
+  })));
+  const { fields } = createForm(body, "説明を保存して再確認", async (form) => {
+    try {
+      const updated = await api(`/adapters/${safeId(record.id)}/explanation`, { digest: record.digest, explanation: readExplanation(form) }, state.token, "PUT");
+      await openAdapter(updated); toast("説明を保存しました。更新後の内容を再確認してください。"); await refresh(true);
+    } catch (error) {
+      if (error.status === 409) throw new Error("他の画面で変更または承認されています。入力は保存していません。「最新の定義を読み直す」で内容を確認してください。");
+      throw error;
+    }
+  });
+  explanationFields(fields, record.explanation?.human);
+}
+async function openAdapter(record) {
+  const body = openDialog("変換定義を取得中", "REVIEW ADAPTER");
+  const epoch = state.modalEpoch;
+  body.append(el("p", "analysis-text", "最新の定義と説明を取得しています…"));
+  try {
+    const latest = await api(`/adapters/${safeId(adapterObject(record).id)}`);
+    if (state.modalEpoch === epoch && $("#action-dialog").open) renderAdapterReview(latest);
+  } catch (error) {
+    if (state.modalEpoch === epoch) body.replaceChildren(message(error.message, "error"));
+  }
+}
+function renderAdapterReview(record) {
   const definition = adapterObject(record); const status = record.status || (record.active ? "ACTIVE" : "DRAFT");
   const body = openDialog(definition.name || "変換定義", "REVIEW ADAPTER");
-  append(body, badge(status), jsonDetails("固定された定義の全体", definition, true), el("code", "digest", `SHA-256 ${record.digest || definition.digest || "未記録"}`));
+  append(body, badge(status), renderAdapterExplanation(record), jsonDetails("固定された定義の全体", definition), el("code", "digest", `SHA-256 ${record.digest || definition.digest || "未記録"}`));
+  body.append(button("最新の定義を読み直す", (event) => busy(event.currentTarget, async () => {
+    await openAdapter(record);
+  })));
+  if (status === "DRAFT" && (can("configure") || can("operate"))) body.append(button("監視目的・説明を編集", () => editAdapterExplanation(record)));
   const preview = el("div");
   body.append(append(el("div", "card-actions"), button("標本で検証", (event) => busy(event.currentTarget, async () => {
     const result = await api(`/adapters/${safeId(definition.id)}/validate`, {});
@@ -692,16 +759,27 @@ function openAdapter(record) {
   body.append(preview);
   const actions = el("div", "form-actions");
   if (status === "DRAFT" || status === "PENDING") {
-    const approveAllowed = can("approve") && !selfProposed(record) && Boolean(record.digest || definition.digest);
+    let stale = false;
+    const contributed = selfProposed(record) || (record.explanation_editors || []).includes(state.session?.actor);
+    const approveAllowed = can("approve") && !contributed && Boolean(record.digest || definition.digest);
     const confirm = el("label", "check-line"); const checkbox = el("input"); checkbox.type = "checkbox";
-    append(confirm, checkbox, document.createTextNode("対象・版・項目と値の意味・適用条件を確認し、この定義の有効化を承認します。")); body.append(confirm);
+    append(confirm, checkbox, document.createTextNode("対象・版・項目と値の意味・適用条件・監視目的・提案理由・確認事項（未記録の項目を含む）を確認し、この定義の有効化を承認します。")); body.append(confirm);
     const approve = button("この定義を承認", (event) => busy(event.currentTarget, async () => {
-      await api(`/adapters/${safeId(definition.id)}/approve`, { digest: record.digest || definition.digest }); $("#action-dialog").close(); toast("確認した変換定義を承認しました。"); await refresh(true);
+      try { await api(`/adapters/${safeId(definition.id)}/approve`, { digest: record.digest || definition.digest }); }
+      catch (error) {
+        if (error.status === 409) {
+          stale = true; checkbox.checked = false;
+          const notice = message("承認対象が変更されたか、現在の条件で承認できません。「最新の定義を読み直す」で説明と定義を再確認してください。", "warning");
+          notice.setAttribute("role", "alert"); body.prepend(notice);
+        }
+        throw error;
+      }
+      $("#action-dialog").close(); toast("確認した変換定義を承認しました。"); await refresh(true);
     }), "button primary", false);
-    approve.title = approveAllowed ? "内容を確認してチェックを入れてください" : "承認権限と提案者とは異なる主体が必要です";
-    const update = () => { approve.disabled = approve.getAttribute("aria-busy") === "true" || !approveAllowed || !checkbox.checked; };
+    approve.title = approveAllowed ? "内容を確認してチェックを入れてください" : "承認権限と、提案者・説明編集者とは異なる主体が必要です";
+    const update = () => { approve.disabled = approve.getAttribute("aria-busy") === "true" || stale || !approveAllowed || !checkbox.checked; };
     checkbox.addEventListener("change", update); approve.addEventListener("opsyne:idle", update); actions.append(approve);
-    if (!approveAllowed) body.append(el("p", "role-note", selfProposed(record) ? "提案者は自己承認できません。別の承認主体で確認してください。" : "承認権限を持つ主体と、記録済みの digest が必要です。"));
+    if (!approveAllowed) body.append(el("p", "role-note", contributed ? "提案者・説明編集者は自己承認できません。別の承認主体で確認してください。" : "承認権限を持つ主体と、記録済みの digest が必要です。"));
   }
   if (["ACTIVE", "APPROVED"].includes(status)) {
     actions.append(button("原本を再解析", (event) => busy(event.currentTarget, async () => {
