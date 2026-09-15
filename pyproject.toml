@@ -25,7 +25,7 @@ dev = [
   "hatchling>=1.27,<2",
   "httpx2>=2,<3",
   "import-linter>=2.3,<3",
-  "mypy>=1.15,<2",
+  "mypy>=1.15,<3",
   "pytest>=8.3,<10",
   "ruff>=0.11,<1",
 ]
