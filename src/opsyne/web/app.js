@@ -960,8 +960,8 @@ function reviewPlan(record, item, execute = false) {
   if (expired) body.append(message("この計画は期限切れです。新しい計画を作成して、改めて確認・承認してください。", "warning"));
   const isSelf = selfProposed(plan);
   if (status === "DRAFT" && isSelf) body.append(el("p", "role-note", "提案者は自己承認できません。別の承認主体で内容を確認してください。"));
-  if (runRecovery) body.append(message("承認後はサーバーが復旧処理と正常性確認を進めます。受付後は画面を閉じても処理を継続します。対象変更や期限切れの場合は停止します。"));
-  else if (status === "DRAFT" && can("approve")) body.append(message("この役割では承認まで行えます。承認後、実行権限のある担当者が復旧処理を開始してください。"));
+  if (execute) body.append(message("復旧処理の結果を受け取った後、この画面から正常性確認を要求します。完了まで画面を開いておいてください。"));
+  else if (runRecovery) body.append(message("承認後はサーバーが復旧処理と正常性確認を進めます。受付後は画面を閉じても処理を継続します。対象変更や期限切れの場合は停止します。"));
   if (status === "DRAFT" || (execute && status === "APPROVED")) {
     const footer = el("div", "recovery-footer");
     const confirm = el("label", "check-line"); const checkbox = el("input"); checkbox.type = "checkbox";
@@ -985,8 +985,10 @@ function reviewPlan(record, item, execute = false) {
       let phase = execute ? 1 : 0;
       try {
         if (!execute) {
+          steps[0].textContent = "承認：処理中";
           let job = await api(`/plans/${safeId(plan.id)}/approve-and-execute`, { digest: plan.digest }, token);
           if (!isCurrent()) return;
+          phase = 1;
           steps[0].textContent = "承認：完了";
           planStatus.replaceChildren(badge("APPROVED"));
           while (isCurrent()) {
@@ -998,19 +1000,6 @@ function reviewPlan(record, item, execute = false) {
             if (!isCurrent()) return;
             job = await api(`/plans/${safeId(plan.id)}/recovery`, undefined, token);
           }
-          return;
-        }
-        if (!execute) {
-          steps[0].textContent = "承認：処理中";
-          const approved = await api(`/plans/${safeId(plan.id)}/approve`, { digest: plan.digest }, token);
-          if (!isCurrent()) return;
-          if (approved?.status !== "APPROVED" || planObject(approved).id !== plan.id || planObject(approved).digest !== plan.digest) throw new Error("確認した計画の承認結果を取得できませんでした。");
-          steps[0].textContent = "承認：完了";
-          planStatus.replaceChildren(badge("APPROVED"));
-        }
-        if (!runRecovery) {
-          steps[1].textContent = "復旧処理：実行担当者の操作待ち";
-          showFeedback("計画を承認しました。実行権限のある担当者が「復旧処理を開始」から実行してください。");
           return;
         }
         phase = 1; steps[1].textContent = "復旧処理：実行中";
@@ -1033,8 +1022,8 @@ function reviewPlan(record, item, execute = false) {
       } catch (error) {
         if (!isCurrent()) return;
         steps[phase].textContent = `${["承認", "復旧処理", "復旧確認"][phase]}：結果を確認できません`;
-        if (phase < 2) steps[phase + 1].textContent = `${["承認", "復旧処理", "復旧確認"][phase + 1]}：未実施`;
-        const guidance = ["受付または進捗を確認できません。サーバーで処理中の可能性があります。再送せず案件と実行記録を確認してください。", "復旧処理の結果を確認できません。再実行せず、実行記録と監査ログを確認してください。", "復旧処理は成功しましたが、復旧確認の結果を取得できません。実行記録から復旧確認をやり直してください。"][phase];
+        if (phase < 2) steps[phase + 1].textContent = `${["承認", "復旧処理", "復旧確認"][phase + 1]}：${execute ? "未実施" : "状態不明"}`;
+        const guidance = !execute ? "受付または進捗を確認できません。サーバーで処理中の可能性があります。再送せず案件と実行記録を確認してください。" : ["", "復旧処理の結果を確認できません。再実行せず、実行記録と監査ログを確認してください。", "復旧処理は成功しましたが、復旧確認の結果を取得できません。実行記録から復旧確認をやり直してください。"][phase];
         showFeedback(`${guidance}\n${error.message}`, "error");
       } finally {
         if (isCurrent()) { records.hidden = false; await refresh(); }
