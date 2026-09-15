@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -122,6 +123,7 @@ class Runtime:
         for target, name in [
             (self._observation_loop, "opsyne-collector"),
             (self._investigation_loop, "opsyne-investigator"),
+            (self._recovery_loop, "opsyne-recovery"),
         ]:
             thread = threading.Thread(target=target, name=name, daemon=True)
             self._threads.append(thread)
@@ -167,6 +169,66 @@ class Runtime:
             finding.severity,
             finding.evidence_ids,
         )
+
+    def _recovery_loop(self) -> None:
+        while not self._stop.is_set():
+            with suppress(Exception):
+                self.run_recovery()
+            self._stop.wait(1)
+
+    def run_recovery(self) -> dict[str, Any] | None:
+        with self._execution_lock:
+            for job in self.control.objects("recovery"):
+                if job["status"] not in {"QUEUED", "EXECUTING", "VERIFYING"}:
+                    continue
+                plan_id = job["plan_id"]
+                execution = self.runner.for_plan(plan_id)
+                try:
+                    if execution is None:
+                        if job["status"] != "QUEUED":
+                            return self.control.update_recovery(
+                                plan_id,
+                                "BLOCKED",
+                                "実行開始中に停止しました。実行台帳と予約を照合してください。",
+                            )
+                        self.control.authorize_recovery(plan_id)
+                        self.control.update_recovery(
+                            plan_id, "EXECUTING", "登録された復旧操作を実行しています。"
+                        )
+                        execution = self.execute(
+                            plan_id, Actor(actor="system:recovery", role="operator")
+                        )
+                    if execution.status != "SUCCEEDED":
+                        return self.control.update_recovery(
+                            plan_id,
+                            "FAILED" if execution.status == "FAILED" else "UNKNOWN",
+                            "操作結果を実行台帳で確認してください。自動再実行しません。",
+                            execution.id,
+                        )
+                    self.control.update_recovery(
+                        plan_id, "VERIFYING", "サービスの正常性を確認しています。", execution.id
+                    )
+                    verification = self.verify(
+                        execution.id, Actor(actor="system:recovery", role="operator")
+                    )
+                    return self.control.update_recovery(
+                        plan_id,
+                        "COMPLETED" if verification.status == "PASS" else "CHECK_FAILED",
+                        "復旧処理と正常性確認が完了しました。"
+                        if verification.status == "PASS"
+                        else "操作は成功しましたが正常性を確認できません。再確認してください。",
+                        execution.id,
+                    )
+                except Exception as exc:
+                    return self.control.update_recovery(
+                        plan_id,
+                        "BLOCKED" if execution is None else "CHECK_FAILED",
+                        str(exc)
+                        if isinstance(exc, (Denied, Conflict))
+                        else "処理結果を確認できません。実行台帳を確認してください。",
+                        execution.id if execution else None,
+                    )
+        return None
 
     def process(self, raw: RawEvent, reprocess: bool = False) -> None:
         service = self.control.service(raw.service_id)
@@ -492,8 +554,46 @@ class Runtime:
                     recommendations=recommendations,
                 )
             else:
-                analysis = self.investigator.investigate(task, evidence)
+                service_before = self.control.service(task.service_id)
+                capabilities = [
+                    Capability.model_validate(item)
+                    for item in self.control.objects("capability")
+                    if item["service_id"] == task.service_id
+                ]
+                if case.kind == "operation_failure":
+                    analysis = self.investigator.investigate(
+                        task,
+                        evidence,
+                        {
+                            "capabilities": [
+                                {
+                                    "id": item.id,
+                                    "version": item.version,
+                                    "name": item.name,
+                                    "kind": item.kind,
+                                }
+                                for item in capabilities
+                            ],
+                            "target_instance_id": service_before.instance_id,
+                            "target_version": service_before.version,
+                            "verification": {
+                                key: value
+                                for key, value in self.control.get("check", task.service_id).items()
+                                if key in {"kind", "expected_status", "body_contains"}
+                            },
+                        },
+                    )
+                else:
+                    analysis = self.investigator.investigate(task, evidence)
                 self.validate_grant(grant)
+                if case.kind == "operation_failure":
+                    self._propose_recovery(
+                        task,
+                        analysis,
+                        service_before,
+                        capabilities,
+                        [str(entry["id"]) for entry in evidence],
+                    )
             self.control.finish_task(task, analysis)
         except Exception as exc:
             detail = (
@@ -506,6 +606,87 @@ class Runtime:
             self.control.finish_task(task, None, detail)
         self.discoveries.schedule(enabled=False, configured=self.llm_configured)
         return Task.model_validate(self.control.get("task", task.id))
+
+    def _propose_recovery(
+        self,
+        task: Task,
+        analysis: Analysis,
+        service: Service,
+        capabilities: list[Capability],
+        evidence_ids: list[str],
+    ) -> None:
+        record: dict[str, Any] = {
+            "id": task.case_id,
+            "task_id": task.id,
+            "status": "BLOCKED",
+            "detail": "実行可能な復旧操作を提案できませんでした。",
+            "plan_id": None,
+        }
+        try:
+            choice = analysis.recovery
+            if choice is None:
+                return
+            with self._lock:
+                if self.control.service(task.service_id) != service:
+                    raise Denied("調査中に対象または確認条件が変更されました。再調査してください。")
+                capability = next(
+                    (
+                        item
+                        for item in capabilities
+                        if item.id == choice.capability_id
+                        and item.version == choice.capability_version
+                    ),
+                    None,
+                )
+                if (
+                    capability is None
+                    or Capability.model_validate(self.control.get("capability", capability.id))
+                    != capability
+                ):
+                    raise Denied("提案された操作が登録内容と一致しません。")
+                case = self.control.get("case", task.case_id)
+                if set(case["evidence_ids"]) != set(evidence_ids):
+                    raise Denied("調査した根拠と現在の案件が一致しません。再調査してください。")
+                if not choice.evidence_ids or not set(choice.evidence_ids).issubset(
+                    task.evidence_ids or case["evidence_ids"]
+                ):
+                    raise Denied("復旧提案の根拠を確認できません。")
+                key = hashlib.sha256(
+                    json.dumps(
+                        [
+                            task.case_id,
+                            service.model_dump(mode="json"),
+                            sorted(case["evidence_ids"]),
+                        ],
+                        sort_keys=True,
+                    ).encode()
+                ).hexdigest()
+                existing = next(
+                    (
+                        item
+                        for item in self.control.objects("plan")
+                        if item.get("proposal_key") == key
+                    ),
+                    None,
+                )
+                plan = existing or self.control.create_plan(
+                    task.case_id,
+                    capability.id,
+                    choice.reason,
+                    f"agent:{task.id}",
+                    task_id=task.id,
+                    proposal_key=key,
+                )
+                record.update(
+                    status="PROPOSED",
+                    detail="復旧計画を作成しました。内容を確認して承認してください。",
+                    plan_id=plan["id"],
+                )
+        except (Denied, Conflict, KeyError) as exc:
+            record["detail"] = str(exc)
+        finally:
+            with self.control.db.connection() as db:
+                self.control._put(db, "recovery_proposal", task.case_id, record)
 
     def case_detail(self, case_id: str) -> dict[str, Any]:
         case = self.control.get("case", case_id)
@@ -528,6 +709,17 @@ class Runtime:
             adapter_analysis = None
         return {
             "case": case,
+            "recoveries": [
+                item for item in self.control.objects("recovery") if item["case_id"] == case_id
+            ],
+            "recovery_proposal": next(
+                (
+                    item
+                    for item in self.control.objects("recovery_proposal")
+                    if item["id"] == case_id
+                ),
+                None,
+            ),
             "evidence": evidence,
             "plans": plans,
             "executions": [item for item in self.execution_list() if item["plan_id"] in ids],

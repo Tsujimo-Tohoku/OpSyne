@@ -805,6 +805,8 @@ async function openCase(id) {
 function section(title, ...children) { return append(el("section", "detail-section"), el("h3", "", title), ...children); }
 function renderCaseDetail(body, detail) {
   const item = detail.case; $("#dialog-title").textContent = item.title || item.id; body.replaceChildren();
+  for (const job of detail.recoveries || []) body.append(message(`${job.status}：${job.detail}`));
+  if (detail.recovery_proposal) body.append(message(detail.recovery_proposal.detail));
   const statusNode = badge(item.status);
   append(body, append(el("div", "detail-topline"), severity(item.severity), statusNode, el("code", "detail-id", item.id)), info([["対象サービス", serviceName(item.service_id)], ["観測源", sourceName(item.source_id)], ["作成日時", date(item.created_at, true)], ["更新日時", date(item.updated_at, true)]]));
   const proposalButton = button("変換案を手動生成", (event) => busy(event.currentTarget, async () => {
@@ -928,7 +930,7 @@ async function planForm(item) {
 }
 function reviewPlan(record, item, execute = false) {
   const plan = planObject(record); const status = record.status || "DRAFT";
-  const runRecovery = execute || can("operate") && can("approve");
+  const runRecovery = execute || can("approve");
   const body = openDialog(execute ? "復旧処理を開始" : "復旧計画を確認", "PLAN REVIEW", true);
   $("#action-dialog").classList.add("recovery-review");
   const epoch = state.modalEpoch;
@@ -958,7 +960,7 @@ function reviewPlan(record, item, execute = false) {
   if (expired) body.append(message("この計画は期限切れです。新しい計画を作成して、改めて確認・承認してください。", "warning"));
   const isSelf = selfProposed(plan);
   if (status === "DRAFT" && isSelf) body.append(el("p", "role-note", "提案者は自己承認できません。別の承認主体で内容を確認してください。"));
-  if (runRecovery) body.append(message("確認した操作を実行し、その後にサービスの正常性を確認します。対象や設定の変更、期限切れ、実行条件の不一致があれば停止します。処理が終わるまでこの画面を開いたままにしてください。"));
+  if (runRecovery) body.append(message("承認後はサーバーが復旧処理と正常性確認を進めます。受付後は画面を閉じても処理を継続します。対象変更や期限切れの場合は停止します。"));
   else if (status === "DRAFT" && can("approve")) body.append(message("この役割では承認まで行えます。承認後、実行権限のある担当者が復旧処理を開始してください。"));
   if (status === "DRAFT" || (execute && status === "APPROVED")) {
     const footer = el("div", "recovery-footer");
@@ -982,6 +984,22 @@ function reviewPlan(record, item, execute = false) {
       progress.hidden = false; progress.scrollIntoView({ block: "nearest" });
       let phase = execute ? 1 : 0;
       try {
+        if (!execute) {
+          let job = await api(`/plans/${safeId(plan.id)}/approve-and-execute`, { digest: plan.digest }, token);
+          if (!isCurrent()) return;
+          steps[0].textContent = "承認：完了";
+          planStatus.replaceChildren(badge("APPROVED"));
+          while (isCurrent()) {
+            steps[1].textContent = `復旧処理：${job.status === "QUEUED" ? "実行待ち" : job.status === "EXECUTING" ? "実行中" : job.status === "VERIFYING" ? "操作成功" : statuses[job.status]?.[0] || job.status}`;
+            steps[2].textContent = `復旧確認：${job.status === "VERIFYING" ? "確認中" : job.status === "COMPLETED" ? "正常性を確認" : "未完了"}`;
+            showFeedback(job.detail + " 受付後は画面を閉じても処理を継続します。", ["BLOCKED", "FAILED", "UNKNOWN", "CHECK_FAILED"].includes(job.status) ? "warning" : "info");
+            if (!["QUEUED", "EXECUTING", "VERIFYING"].includes(job.status)) break;
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            if (!isCurrent()) return;
+            job = await api(`/plans/${safeId(plan.id)}/recovery`, undefined, token);
+          }
+          return;
+        }
         if (!execute) {
           steps[0].textContent = "承認：処理中";
           const approved = await api(`/plans/${safeId(plan.id)}/approve`, { digest: plan.digest }, token);
@@ -1016,7 +1034,7 @@ function reviewPlan(record, item, execute = false) {
         if (!isCurrent()) return;
         steps[phase].textContent = `${["承認", "復旧処理", "復旧確認"][phase]}：結果を確認できません`;
         if (phase < 2) steps[phase + 1].textContent = `${["承認", "復旧処理", "復旧確認"][phase + 1]}：未実施`;
-        const guidance = ["承認結果を確認できなかったため、復旧処理は要求していません。案件の最新状態を確認してください。", "復旧処理の結果を確認できません。再実行せず、実行記録と監査ログを確認してください。", "復旧処理は成功しましたが、復旧確認の結果を取得できません。実行記録から復旧確認をやり直してください。"][phase];
+        const guidance = ["受付または進捗を確認できません。サーバーで処理中の可能性があります。再送せず案件と実行記録を確認してください。", "復旧処理の結果を確認できません。再実行せず、実行記録と監査ログを確認してください。", "復旧処理は成功しましたが、復旧確認の結果を取得できません。実行記録から復旧確認をやり直してください。"][phase];
         showFeedback(`${guidance}\n${error.message}`, "error");
       } finally {
         if (isCurrent()) { records.hidden = false; await refresh(); }

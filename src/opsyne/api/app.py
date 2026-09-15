@@ -310,6 +310,24 @@ def create_app(
     def reject(plan_id: str, body: Reason, actor: Actor = authentication) -> dict[str, Any]:
         return state.control.reject(plan_id, actor, body.reason)
 
+    @app.post("/api/plans/{plan_id}/approve-and-execute")
+    def approve_and_execute(
+        plan_id: str, body: Approval, actor: Actor = authentication
+    ) -> dict[str, Any]:
+        state.control.approve(plan_id, body.digest, actor, run_recovery=True)
+        return state.control.get("recovery", plan_id)
+
+    @app.get("/api/plans/{plan_id}/recovery")
+    def recovery_status(plan_id: str, actor: Actor = authentication) -> dict[str, Any]:
+        return state.control.get("recovery", plan_id)
+
+    @app.get("/api/services/{service_id}/recoveries")
+    def service_recoveries(service_id: str, actor: Actor = authentication) -> list[dict[str, Any]]:
+        state.control.service(service_id)
+        return [
+            item for item in state.control.objects("recovery") if item["service_id"] == service_id
+        ]
+
     @app.post("/api/plans/{plan_id}/execute")
     def execute(plan_id: str, actor: Actor = editing) -> dict[str, Any]:
         return state.execute(plan_id, actor).model_dump(mode="json")
