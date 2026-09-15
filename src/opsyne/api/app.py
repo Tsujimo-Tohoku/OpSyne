@@ -7,6 +7,7 @@ import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
@@ -18,9 +19,11 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from opsyne.api.auth import AccessTokens
 from opsyne.api.heroku import install_heroku_drain, load_drains
+from opsyne.collector.log_discovery import discover_logs
 from opsyne.contracts.adapter_reviews import AdapterDraftRequest, ExplanationUpdate
 from opsyne.contracts.core import Actor, Model, Service
 from opsyne.contracts.execution import Capability, CheckConfig
+from opsyne.contracts.log_discovery import LogDiscoveryRequest, LogDiscoveryResult
 from opsyne.contracts.observations import RawInput, Source
 from opsyne.contracts.service_views import ServicePage, ServiceSummary
 from opsyne.control.repository import Conflict
@@ -150,6 +153,18 @@ def create_app(
         return actor
 
     administration = Depends(admin)
+    discovery_lock = Lock()
+
+    @app.post("/api/log-discovery")
+    def log_discovery(
+        body: LogDiscoveryRequest, actor: Actor = administration
+    ) -> LogDiscoveryResult:
+        if not discovery_lock.acquire(blocking=False):
+            raise HTTPException(409, "ログを探索中です。完了後に再実行してください")
+        try:
+            return discover_logs(body)
+        finally:
+            discovery_lock.release()
 
     @app.exception_handler(KeyError)
     async def missing(request: Request, exc: KeyError) -> JSONResponse:

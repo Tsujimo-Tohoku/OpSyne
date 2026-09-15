@@ -40,6 +40,29 @@ python scripts/dev.py run --locked python -m opsyne serve
 
 デモはローカルの合成対象を変更します。実サービスへ通信しません。既存のデモを再準備しても、復旧した対象を故障状態へ戻しません。最初から試す場合は新しい `--data-dir` を使います。LLMキー未設定で調査を要求すると、不足を記録した失敗taskになり、正常扱いにはしません。
 
+## ログの保存場所がわからないとき
+
+1. `owner` でログインし、サービスを登録します。
+2. 「観測源」→「＋ 観測源を登録」で、取込方式に「ログファイル」を選びます。
+3. 「アプリのフォルダー」に **OpSyne が動くサーバー上の配置場所** を入力し、「ログを探す」を押します。例: `/opt/my-app`、`C:\apps\my-app`。ブラウザを開いている PC のフォルダーを送信する機能ではありません。
+4. フォルダー配下と、設定に書かれた別フォルダーのログ出力先から候補が表示されます。HTTPアクセス・エラー・起動停止の記録、更新時刻、参照元の設定を確認し、「このログを選ぶ」を押します。
+5. 対象サービス、ID、名前を確認して登録します。候補を選ぶだけでは登録されません。登録後は既存の変換定義の確認・承認に進みます。
+
+GitHub 連携や新しい読取権限は不要です。OpSyne のプロセスに読める範囲で探します。読めない場所、見つからない出力先、探索上限は表示します。標準出力や journal に送っている設定の場合は、その旨を表示するので転送方法を設定してください。
+
+対象の主なファイル名は `.log`、`.log.1` などの番号付きログ、`.out`、`.err`、`.jsonl`、`.ndjson`、`access_log`、`error_log`。設定は `.conf`、`.ini`、`.yaml`、`.yml`、`.toml`、`.properties`、`.service`、`.json` の対応する明示的な項目を読みます。例: `access_log`、`error_log`、`LOG_FILE`、`LOG_DIR`、`logging.file.name`、`filename`（ログらしい拡張子）、`StandardOutput=append:...`。すべての設定構造・ログ形式への対応ではありません。
+
+候補の分類は少量の末尾サンプルからの推定です。サービスへの帰属や現在の正常性を判断するものではありません。空や未判定の候補も表示します。見つからなければ探索フォルダーを変えるか、ログパスを直接入力できます。リンク先・依存パッケージ・既知の秘密ファイルなどは探索対象外です。詳細な上限と境界は [ADR 0007](adr/0007-local-log-discovery.md) に記載しています。
+
+サーバー上の CLI からも同じ探索を使えます。
+
+```text
+python scripts/dev.py run --locked python -m opsyne discover-logs --root /opt/my-app
+python scripts/dev.py run --locked python -m opsyne discover-logs --root /opt/my-app --root /var/log/my-app
+```
+
+結果は JSON。探索完了は終了コード 0、一部未探索は 2 です。探索だけでは監視登録や状態ファイルを作成しません。API は admin トークンで `POST /api/log-discovery` に `{"roots":["/opt/my-app"]}` を送信します。
+
 ## 3. OpenAI APIを設定する
 
 [`.env.example`](../.env.example) を `.env` としてコピーし、必要な値をローカルで設定します。

@@ -537,9 +537,75 @@ function sourceForm() {
   formField(fields, "観測源 ID", "id", identifierOptions()); formField(fields, "観測源名", "name");
   formField(fields, "対象サービス", "service_id", { options: rows("services").map((item) => [item.id, item.name]) });
   const kind = formField(fields, "取込方式", "kind", { options: [["push", "Push / API"], ["file", "ログファイル"]], value: "push" });
-  const path = formField(fields, "ログファイルの絶対パス", "path", { full: true, required: false, hint: "サーバーで許可したログディレクトリ内のファイルを指定します。" }); path.parentElement.hidden = true;
-  kind.addEventListener("change", () => { path.parentElement.hidden = kind.value !== "file"; path.required = kind.value === "file"; });
+  const path = formField(fields, "ログファイルの絶対パス", "path", { full: true, required: false, hint: "OpSyne が動くサーバー上の、読み取り可能なファイルを指定します。" }); path.parentElement.hidden = true;
+  const finder = logDiscovery(fields, (candidate) => {
+    path.value = candidate.path;
+    const name = fields.querySelector('[name="name"]');
+    if (!name.value) name.value = candidate.path.split(/[\\/]/).pop();
+    path.focus();
+  });
+  finder.hidden = true;
+  kind.addEventListener("change", () => {
+    path.parentElement.hidden = kind.value !== "file"; path.required = kind.value === "file";
+    finder.hidden = kind.value !== "file";
+  });
   formField(fields, "受信遅延と判定する秒数", "stale_after_seconds", { value: 300, type: "number", min: 1, max: 604800, full: true });
+}
+function logDiscovery(fields, choose) {
+  const wrapper = el("section", "form-field full log-discovery");
+  const title = el("h3", "", "ログの場所がわからない場合");
+  const label = el("label", "", "アプリのフォルダー"); label.htmlFor = "log-search-root";
+  const root = el("input"); root.id = "log-search-root"; root.placeholder = "/opt/my-app";
+  root.setAttribute("aria-describedby", "log-search-help");
+  const help = el("p", "field-hint", "OpSyne が動くサーバー上のフォルダーを指定してください。配下と、設定に書かれた別フォルダーのログ出力先を探します。"); help.id = "log-search-help";
+  const results = el("div", "discovery-results"); results.setAttribute("aria-live", "polite");
+  const epoch = state.modalEpoch;
+  const reasons = {
+    excluded: "依存フォルダー・秘密ファイルなどは探索対象外です",
+    permission_denied: "読み取り権限がありません", missing: "指定先が見つかりません", not_directory: "フォルダーではありません",
+    linked_path: "リンク先の探索は対象外です", special_file: "通常のファイルではありません", read_error: "読み取れませんでした",
+    changed_file: "探索中にファイルが変わりました", binary_file: "テキストのログではありません",
+    config_truncated: "設定が大きいため一部のみ確認しました", unresolved_reference: "変数などを含む出力先は手動確認が必要です",
+    unsupported_reference: "対応していない形式の出力先です", unsupported_path: "ローカルのパスではありません",
+    non_file_destination: "標準出力・journal などの出力先があります。転送方法の設定が必要です",
+    config_depth: "設定の入れ子が深いため一部のみ確認しました", read_budget: "読み取り量の上限に達しました",
+    sample_no_complete_line: "サンプル内に行全体が収まらないため分類できませんでした",
+  };
+  const signals = { http_requests: "HTTPアクセス", errors: "エラーの記録", lifecycle: "起動・停止の記録" };
+  const search = button("ログを探す", async () => {
+    if (!root.value.trim()) { results.replaceChildren(message("アプリのフォルダーを入力してください。", "error")); root.focus(); return; }
+    await busy(search, async () => {
+      results.replaceChildren(el("p", "muted", "ログを探しています…"));
+      try {
+        const result = await api("/log-discovery", { roots: [root.value.trim()] });
+        if (state.modalEpoch !== epoch || !wrapper.isConnected || !$("#action-dialog").open) return;
+        const summary = result.status === "partial" ? "一部を探索できませんでした。" : "指定範囲の探索が完了しました。";
+        results.replaceChildren(message(`${summary} ${result.candidates.length} 件の候補が見つかりました。`));
+        results.append(el("p", "field-hint", "選ぶと登録欄にパスが入ります。対象サービスのログか確認して登録してください。分類は少量のサンプルからの推定で、サービスの正常性を示すものではありません。"));
+        for (const candidate of result.candidates) {
+          const card = el("article", "discovery-candidate");
+          const evidence = candidate.signals.map((signal) => signals[signal] || signal).join("・") || (candidate.format === "empty" ? "空のファイル：内容は未確認" : candidate.format === "unreadable" ? "本文の読み取り不可" : "ログの種類は未判定");
+          append(card, el("strong", "", candidate.path), el("p", "field-hint", `${evidence} ／ 更新: ${date(candidate.modified_at)}`));
+          for (const reference of candidate.references.slice(0, 3)) card.append(el("p", "field-hint", `設定の出力先: ${reference.config_path}${reference.line ? `:${reference.line}` : ""}`));
+          card.append(button("このログを選ぶ", () => { choose(candidate); toast("ログのパスを入力しました。登録内容を確認してください。"); }, "button", candidate.format !== "unreadable"));
+          results.append(card);
+        }
+        if (!result.candidates.length) results.append(el("p", "field-hint", "ログが存在しないとは限りません。フォルダーを変えて探すか、ログのパスを直接入力してください。"));
+        if (result.limits_reached.length) results.append(message("探索上限に達しました。範囲を狭めて再度探してください。"));
+        const notices = result.notices;
+        if (notices.length) {
+          const details = el("details"); details.append(el("summary", "", "探索できなかった場所・確認が必要な設定"));
+          for (const notice of notices) details.append(el("p", "field-hint", `${notice.path}: ${reasons[notice.reason] || "確認が必要です"}`));
+          results.append(details);
+        }
+      } catch (error) {
+        if (state.modalEpoch === epoch && wrapper.isConnected) results.replaceChildren(message(error.message, "error"));
+      }
+    });
+  });
+  root.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); search.click(); } });
+  append(wrapper, title, label, root, help, search, results); fields.append(wrapper);
+  return wrapper;
 }
 function ingestForm(source) {
   const body = openDialog("イベントを取り込む", source.name);
