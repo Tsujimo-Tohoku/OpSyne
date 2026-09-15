@@ -49,7 +49,7 @@ jobs:
               output.write(f"version={version}\n")
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           version: ${{ steps.uv-version.outputs.version }}
           enable-cache: true
